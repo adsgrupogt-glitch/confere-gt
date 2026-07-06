@@ -1,5 +1,9 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { login as fbLogin, trocarSenha as fbTrocarSenha, garantirUsuariosSeed } from './auth';
+import { extrairTextoLayout } from './pdf-texto';
+import { parseFolha } from './parser-folha';
+import { tier1Legal } from './regras-tier1';
+import { salvarResumoCompetencia, salvarExcecoes, registrarAtividade } from './dados';
 
 /* ============================================================
    CONFERE GT — Grupo GT
@@ -349,46 +353,107 @@ function Dashboard({ competencia, setCompetencia }) {
 }
 
 function UploadScreen() {
-  const passos = [
-    { label: 'Relação de Cálculo (Senior/Rubi)', desc: 'PDF da folha calculada do mês' },
-    { label: 'Histórico de Afastamentos', desc: 'Faltas, atestados, férias, licenças do período' },
-    { label: 'Relatório de Horas Extras', desc: 'Ponto Nexti — horas registradas' },
-    { label: 'Extrato de Banco de Horas', desc: 'Opcional — só para postos com compensação', opcional: true },
-  ];
-  const [enviados, setEnviados] = useState({});
-  const todosObrigatorios = passos.every((p, i) => p.opcional || enviados[i]);
+  const [competencia, setCompetencia] = useState('07/2026');
+  const [arquivo, setArquivo] = useState(null);
+  const [status, setStatus] = useState('idle'); // idle | lendo | analisando | concluido | erro
+  const [progresso, setProgresso] = useState(null);
+  const [resultado, setResultado] = useState(null);
+  const [erro, setErro] = useState('');
+
+  const rodarConferencia = async () => {
+    if (!arquivo) return;
+    setStatus('lendo'); setErro(''); setResultado(null);
+    try {
+      const buffer = await arquivo.arrayBuffer();
+      const texto = await extrairTextoLayout(buffer, (p, total) => setProgresso({ p, total }));
+
+      setStatus('analisando');
+      const colaboradores = parseFolha(texto);
+      if (colaboradores.length === 0) throw new Error('Não consegui reconhecer nenhum colaborador neste PDF — confirma se é a Relação de Cálculo do Senior/Rubi.');
+
+      const [mesStr, anoStr] = competencia.split('/');
+      const periodoInicio = new Date(parseInt(anoStr, 10), parseInt(mesStr, 10) - 1, 1);
+      const excecoesT1 = tier1Legal(colaboradores, periodoInicio, competencia);
+      const alta = excecoesT1.filter((x) => x.confianca === 'alta').length;
+
+      const proventos = colaboradores.reduce((s, e) => s + (e.totais.proventos || 0), 0);
+      const descontos = colaboradores.reduce((s, e) => s + (e.totais.descontos || 0), 0);
+      const liquido = colaboradores.reduce((s, e) => s + (e.totais.liquido || 0), 0);
+
+      await salvarResumoCompetencia(competencia, {
+        status: 'em_conferencia', colaboradores: colaboradores.length, proventos, descontos, liquido,
+      });
+      await salvarExcecoes(competencia, 't1', excecoesT1);
+      await registrarAtividade(
+        `Conferência de ${competencia} rodada: ${colaboradores.length} colaboradores, ${excecoesT1.length} exceções em INSS/FGTS/VT (${alta} de alta confiança).`,
+        alta > 0 ? 'alerta' : 'resolvido'
+      );
+
+      setResultado({ colaboradores: colaboradores.length, proventos, liquido, excecoes: excecoesT1.length, alta });
+      setStatus('concluido');
+    } catch (e) {
+      setErro(e.message || 'Algo deu errado ao processar o PDF.');
+      setStatus('erro');
+    }
+  };
 
   return (
     <div>
-      <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Nova Conferência</div><h1 style={s.pageTitle}>Subir folha de 07/2026</h1></div></div>
+      <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Nova Conferência</div><h1 style={s.pageTitle}>Subir folha de pagamento</h1></div></div>
+
       <div style={s.grid2}>
         <div style={s.panel}>
-          {passos.map((p, i) => (
-            <div key={i} style={s.uploadRow}>
-              <div style={{ ...s.uploadCheck, ...(enviados[i] ? s.uploadCheckDone : {}) }}>{enviados[i] ? '✓' : i + 1}</div>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 600, fontSize: 13.5 }}>{p.label}</div>
-                <div style={{ fontSize: 12, color: BRAND.gray }}>{p.desc}</div>
-              </div>
-              <button style={s.btnGhost} onClick={() => setEnviados({ ...enviados, [i]: true })}>{enviados[i] ? 'Substituir' : 'Selecionar PDF'}</button>
+          <label style={s.label}>Competência</label>
+          <input style={{ ...s.inputText, marginBottom: 16 }} value={competencia}
+            onChange={(e) => setCompetencia(e.target.value)} placeholder="07/2026" />
+
+          <label style={s.label}>Relação de Cálculo (PDF do Senior/Rubi)</label>
+          <div style={s.fileDrop}>
+            <input type="file" accept="application/pdf" style={s.fileInput}
+              onChange={(e) => setArquivo(e.target.files[0] || null)} />
+            <div style={{ fontSize: 13, color: arquivo ? '#1A2B38' : BRAND.gray, fontWeight: arquivo ? 600 : 400 }}>
+              {arquivo ? `📄 ${arquivo.name}` : 'Clique ou arraste o PDF aqui'}
             </div>
-          ))}
-          <button style={{ ...s.btnPrimary, marginTop: 22, width: '100%' }} disabled={!todosObrigatorios}>Rodar conferência completa</button>
-        </div>
-        <div style={s.panel}>
-          <div style={s.panelTitle}>O que roda automaticamente</div>
-          {Object.values(TIER_META).map((t) => (
-            <div key={t.label} style={s.checklistRow}>
-              <Hex size={16} fill={BRAND.teal} />
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>{t.label}</div>
-                <div style={{ fontSize: 11.5, color: BRAND.gray }}>{t.desc}</div>
+          </div>
+
+          <button style={{ ...s.btnPrimary, marginTop: 20 }} onClick={rodarConferencia}
+            disabled={!arquivo || status === 'lendo' || status === 'analisando'}>
+            {status === 'lendo' ? `Lendo PDF${progresso ? ` (página ${progresso.p}/${progresso.total})` : ''}…`
+              : status === 'analisando' ? 'Rodando conferência…'
+              : 'Rodar conferência'}
+          </button>
+
+          {status === 'erro' && <div style={{ ...s.errorText, marginTop: 12 }}>{erro}</div>}
+
+          {status === 'concluido' && resultado && (
+            <div style={s.resultBox}>
+              <div style={{ fontWeight: 700, color: BRAND.deep, marginBottom: 10 }}>✓ Conferência concluída</div>
+              <div style={s.resultRow}><span>Colaboradores processados</span><b>{fmtNum(resultado.colaboradores)}</b></div>
+              <div style={s.resultRow}><span>Proventos</span><b>{fmtBRL(resultado.proventos)}</b></div>
+              <div style={s.resultRow}><span>Líquido</span><b>{fmtBRL(resultado.liquido)}</b></div>
+              <div style={s.resultRow}><span>Exceções (INSS/FGTS/VT)</span><b style={{ color: resultado.alta > 0 ? '#D64545' : BRAND.deep }}>{resultado.excecoes} ({resultado.alta} de alta confiança)</b></div>
+              <div style={{ fontSize: 11.5, color: BRAND.gray, marginTop: 10, lineHeight: 1.5 }}>
+                Salvo no Firebase em <code>folhas/{competencia.replace('/', '-')}</code>. Consulte a aba Exceções para o detalhe linha a linha.
               </div>
+            </div>
+          )}
+        </div>
+
+        <div style={s.panel}>
+          <div style={s.panelTitle}>O que já roda de verdade</div>
+          <div style={s.checklistRow}>
+            <Hex size={16} fill={BRAND.teal} />
+            <div><div style={{ fontSize: 13, fontWeight: 600 }}>{TIER_META.t1.label}</div><div style={{ fontSize: 11.5, color: BRAND.gray }}>{TIER_META.t1.desc} — ativo, rodando no seu navegador</div></div>
+          </div>
+          {Object.entries(TIER_META).filter(([k]) => k !== 't1').map(([k, t]) => (
+            <div key={k} style={{ ...s.checklistRow, opacity: 0.5 }}>
+              <Hex size={16} fill="none" stroke={BRAND.gray} strokeWidth={4} />
+              <div><div style={{ fontSize: 13, fontWeight: 600 }}>{t.label}</div><div style={{ fontSize: 11.5, color: BRAND.gray }}>{t.desc} — em portagem, ainda roda só no motor Python</div></div>
             </div>
           ))}
           <p style={{ fontSize: 12, color: BRAND.gray, marginTop: 16, lineHeight: 1.6 }}>
-            O resultado vira uma lista de exceções priorizada por confiança e impacto financeiro —
-            antes de qualquer pagamento sair. Nada aqui substitui o Senior; o Confere GT só confere.
+            O PDF é lido inteiramente no seu navegador — nada é enviado a nenhum servidor externo
+            além do próprio Firebase do Grupo GT. Nada aqui substitui o Senior; o Confere GT só confere.
           </p>
         </div>
       </div>
@@ -694,6 +759,10 @@ const s = {
   uploadCheck: { width: 28, height: 28, borderRadius: '50%', border: '1.5px solid #D6E1E5', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, color: BRAND.gray, flexShrink: 0 },
   uploadCheckDone: { background: BRAND.teal, border: 'none', color: '#FFFFFF' },
   checklistRow: { display: 'flex', alignItems: 'flex-start', gap: 10, padding: '9px 0' },
+  fileDrop: { position: 'relative', border: '1.5px dashed #C7D6DC', borderRadius: 10, padding: '22px 16px', textAlign: 'center', background: '#F5F8FA' },
+  fileInput: { position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', width: '100%', height: '100%' },
+  resultBox: { marginTop: 20, background: '#E4F6F8', border: '1px solid #BFE8EA', borderRadius: 10, padding: '16px 18px' },
+  resultRow: { display: 'flex', justifyContent: 'space-between', fontSize: 13, padding: '5px 0', color: '#134450' },
 
   pillRow: { display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' },
   pill: { background: '#FFFFFF', border: '1px solid #DCE5E9', color: '#4C5A66', padding: '7px 14px', borderRadius: 20, fontSize: 12.5, cursor: 'pointer' },
