@@ -58,3 +58,22 @@ export async function extrairTextoLayout(arrayBuffer, onProgress) {
 
   return paginas.join('\n\f\n');
 }
+
+// Extração "sequencial" — sem reconstrução de layout por posição, só junta os
+// itens de texto na ordem em que o PDF os emite. Alguns geradores de PDF (ex:
+// o relatório de Horas Extras/ponto, feito por outra ferramenta que não o
+// Senior) já emitem o texto na ordem de leitura correta; tentar reconstruir
+// layout por coordenada X/Y nesses casos EMBARALHA o texto. Use esta função
+// para esses relatórios; extrairTextoLayout() continua sendo a certa para a
+// Relação de Cálculo (Senior/Rubi) e o Relatório de Chefia.
+export async function extrairTextoSequencial(arrayBuffer, onProgress) {
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const paginas = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    paginas.push(content.items.map((it) => it.str).join(' '));
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+  return paginas.join('\n');
+}
