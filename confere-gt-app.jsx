@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { login as fbLogin, trocarSenha as fbTrocarSenha, garantirUsuariosSeed } from './auth';
 import { extrairTextoLayout, extrairTextoSequencial } from './extrator-pdf';
 import { parseFolha } from './parser-folha';
@@ -19,6 +19,7 @@ import { cruzarChefias } from './analytics-chefia';
 import { gerarAlertas } from './insights';
 import { salvarResumoCompetencia, salvarExcecoes, salvarTiers, salvarAnalytics, salvarColaboradoresResumo, salvarEstruturaOrganizacional, lerEstruturaOrganizacional, registrarAtividade, listarCompetencias, lerCompetencia, listarAtividade, fecharCompetencia, excluirCompetencia, atualizarStatusExcecao } from './dados';
 import { getVetorhApiUrl, setVetorhApiUrl, getVetorhApiKey, setVetorhApiKey, listarEmpresasVetorh, listarCompetenciasVetorh, buscarFolhaVetorh } from './vetorh-api';
+import { rodarEConfirmarConferencia } from './motor-conferencia';
 
 // As 5 empresas do Grupo GT (espelha o backend — usado só pros rótulos e
 // pro seletor; a filtragem de verdade acontece no backend/banco).
@@ -107,6 +108,59 @@ function useTodasCompetencias(numEmp) {
   useEffect(carregar, [numEmp]);
 
   return { ...estado, recarregar: carregar };
+}
+
+// O coração da mudança "sem upload manual": sempre que a empresa muda (ou o
+// Dashboard abre), confere sozinho se a competência mais recente do Vetorh
+// já está sincronizada. Se não estiver — ou se já se passou um tempo desde
+// a última sincronização do mês corrente (que ainda pode estar mudando) —
+// busca, roda o motor de regras e salva, tudo sem o usuário clicar em nada.
+// Competência FECHADA nunca sincroniza sozinha de novo — fechar é decisão
+// humana deliberada, e é isso que preserva a trilha de auditoria (mesmo
+// padrão usado por Workday/ADP: dado fonte sempre vivo, trilha persistida).
+function useSincronizacaoAutomatica(numEmp, meses, recarregarMeses) {
+  const [sincronizando, setSincronizando] = useState(false);
+  const [erroSinc, setErroSinc] = useState(null);
+  const jaTentou = useRef(new Set());
+
+  useEffect(() => {
+    if (!numEmp || !meses) return;
+    let cancelado = false;
+    (async () => {
+      try {
+        const competenciasVetorh = await listarCompetenciasVetorh(numEmp);
+        if (!competenciasVetorh || competenciasVetorh.length === 0) return;
+        const maisRecente = competenciasVetorh[0];
+        const chaveTentativa = `${numEmp}-${maisRecente}`;
+        if (jaTentou.current.has(chaveTentativa)) return;
+
+        const cache = meses.find((m) => m.competencia === maisRecente);
+        if (cache?.resumo?.status === 'fechada') return;
+        if (cache?.resumo?.sincronizadoEm) {
+          const minutos = (Date.now() - new Date(cache.resumo.sincronizadoEm)) / 60000;
+          if (minutos < 30) return; // sincronizado há pouco, não martela o backend
+        }
+
+        jaTentou.current.add(chaveTentativa);
+        setSincronizando(true); setErroSinc(null);
+        const colaboradores = await buscarFolhaVetorh(numEmp, maisRecente);
+        if (cancelado) return;
+        if (colaboradores?.length > 0) {
+          await rodarEConfirmarConferencia(numEmp, maisRecente, colaboradores, {
+            fonte: 'vetorh', origemLabel: 'Sincronização automática com o Vetorh —', nomeUsuario: 'sistema',
+          });
+          if (!cancelado) recarregarMeses();
+        }
+      } catch (e) {
+        if (!cancelado) setErroSinc(e.message || 'Falha ao sincronizar com o Vetorh.');
+      } finally {
+        if (!cancelado) setSincronizando(false);
+      }
+    })();
+    return () => { cancelado = true; };
+  }, [numEmp, meses === null]);
+
+  return { sincronizando, erroSinc };
 }
 
 function Hex({ size = 40, fill = BRAND.blue, stroke, strokeWidth = 0, style }) {
@@ -209,7 +263,7 @@ function LoginScreen({ onLogin }) {
 function Sidebar({ user, tela, setTela, onLogout }) {
   const itens = [
     { id: 'dashboard', label: 'Dashboard' },
-    { id: 'upload', label: 'Nova Conferência' },
+    { id: 'upload', label: 'Sincronização Manual' },
     { id: 'excecoes', label: 'Exceções' },
     { id: 'chefias', label: 'Chefias & Estrutura' },
     { id: 'historico', label: 'Histórico & KPIs' },
@@ -318,8 +372,9 @@ function ActivityFeed() {
 }
 
 function Dashboard({ competencia, setCompetencia, numEmp }) {
-  const { loading, erro, meses } = useTodasCompetencias(numEmp);
+  const { loading, erro, meses, recarregar } = useTodasCompetencias(numEmp);
   const { dados: estrutura } = useEstruturaOrganizacional(numEmp);
+  const { sincronizando, erroSinc } = useSincronizacaoAutomatica(numEmp, loading ? null : meses, recarregar);
 
   if (loading) {
     return (
@@ -339,8 +394,14 @@ function Dashboard({ competencia, setCompetencia, numEmp }) {
   if (meses.length === 0) {
     return (
       <div>
-        <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Painel de Conferência</div><h1 style={s.pageTitle}>Nenhuma conferência rodada ainda</h1></div></div>
-        <div style={s.panel}>Suba uma folha em "Nova Conferência" pra começar a popular o Dashboard com dado real.</div>
+        <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Painel de Conferência</div><h1 style={s.pageTitle}>{sincronizando ? 'Sincronizando com o Vetorh...' : 'Nenhuma conferência ainda'}</h1></div></div>
+        <div style={s.panel}>
+          {sincronizando
+            ? 'Buscando a folha mais recente direto do banco — isso leva só alguns segundos, sem precisar subir nada.'
+            : erroSinc
+              ? <>Não consegui sincronizar automaticamente: {erroSinc}. Confirma se o backend está rodando, ou usa "Nova Conferência" pra subir um PDF manualmente.</>
+              : 'Ainda não há dado sincronizado pra essa empresa. Se ela tiver movimento no Vetorh, a sincronização automática deve trazer os dados em instantes.'}
+        </div>
       </div>
     );
   }
@@ -418,7 +479,7 @@ function Dashboard({ competencia, setCompetencia, numEmp }) {
     <div>
       <div style={s.pageHeader}>
         <div>
-          <div style={s.pageEyebrow}>Painel Executivo · RH</div>
+          <div style={s.pageEyebrow}>Painel Executivo · RH {sincronizando && <span style={{ color: BRAND.teal }}>· ⟳ sincronizando com o Vetorh...</span>}</div>
           <h1 style={s.pageTitle}>Competência {compAtual}</h1>
         </div>
         <div style={s.compSwitch}>
@@ -736,7 +797,7 @@ function UploadScreen({ user, numEmp }) {
       let colaboradores;
       if (fonte === 'vetorh') {
         colaboradores = await buscarFolhaVetorh(numEmp, competencia);
-        if (!colaboradores || colaboradores.length === 0) throw new Error('O Vetorh não retornou nenhum colaborador pra essa empresa/competência. Confirma se o backend está rodando e se essa competência existe (aba "Buscar do Vetorh" já mostra as disponíveis).');
+        if (!colaboradores || colaboradores.length === 0) throw new Error('O Vetorh não retornou nenhum colaborador pra essa empresa/competência. Confirma se o backend está rodando e se essa competência existe.');
       } else {
         const buffer = await arquivo.arrayBuffer();
         const texto = await extrairTextoLayout(buffer, (p, total) => setProgresso({ p, total }));
@@ -745,9 +806,6 @@ function UploadScreen({ user, numEmp }) {
       }
 
       setStatus('analisando');
-      const [mesStr, anoStr] = competencia.split('/');
-      const periodoInicio = new Date(parseInt(anoStr, 10), parseInt(mesStr, 10) - 1, 1);
-      const periodoFim = new Date(parseInt(anoStr, 10), parseInt(mesStr, 10), 0);
 
       let pontoPorMatricula = null;
       if (arquivoHE) {
@@ -764,55 +822,14 @@ function UploadScreen({ user, numEmp }) {
         excecoesT7 = tier7FeriasVencidas(recibos, competencia);
       }
 
-      const excecoesT1 = tier1Legal(colaboradores, periodoInicio, competencia);
-      const excecoesT1c = tier1cCct(colaboradores, periodoInicio, competencia);
-      const excecoesT1d = tier1dVigia(colaboradores, competencia);
-      const excecoesT1e = tier1ePisoRegional(colaboradores, competencia);
-      const excecoesT2 = tier2ConsistenciaPares(colaboradores, competencia);
-      const colaboradoresPorMatricula = Object.fromEntries(colaboradores.map((e) => [e.matricula, e]));
-      const excecoesT5 = pontoPorMatricula ? tier5HorasExtras(colaboradores, pontoPorMatricula, competencia) : [];
-      const excecoesT6 = pontoPorMatricula ? tier6Dobras(pontoPorMatricula, colaboradoresPorMatricula, competencia) : [];
-
-      const todasExcecoes = { t1: excecoesT1, t1c: excecoesT1c, t1d: excecoesT1d, t1e: excecoesT1e, t2: excecoesT2, t5: excecoesT5, t6: excecoesT6, t7: excecoesT7 };
-      const alta = Object.values(todasExcecoes).reduce((s, arr) => s + arr.filter((x) => x.confianca === 'alta').length, 0);
-      const totalExcecoes = Object.values(todasExcecoes).reduce((s, arr) => s + arr.length, 0);
-      const analytics = calcularAnalytics(colaboradores, periodoInicio, periodoFim);
-
-      const proventos = colaboradores.reduce((s, e) => s + (e.totais.proventos || 0), 0);
-      const descontos = colaboradores.reduce((s, e) => s + (e.totais.descontos || 0), 0);
-      const liquido = colaboradores.reduce((s, e) => s + (e.totais.liquido || 0), 0);
-
-      await salvarResumoCompetencia(numEmp, competencia, {
-        status: 'em_conferencia', colaboradores: colaboradores.length, proventos, descontos, liquido,
-        temHorasExtras: !!pontoPorMatricula, fonte,
-      });
-      const tiersParaSalvar = {};
-      for (const [tier, arr] of Object.entries(todasExcecoes)) {
-        await salvarExcecoes(numEmp, competencia, tier, arr);
-        tiersParaSalvar[tier] = { total: arr.length, alta: arr.filter((x) => x.confianca === 'alta').length };
-      }
-      await salvarTiers(numEmp, competencia, tiersParaSalvar);
-      await salvarAnalytics(numEmp, competencia, analytics);
-
-      const colaboradoresResumo = {};
-      for (const e of colaboradores) {
-        colaboradoresResumo[e.matricula] = {
-          nome: e.nome, cargo: e.cargo, cc: e.centro_custo, status: e.status,
-          admissao: e.admissao, proventos: e.totais.proventos || 0, multiCC: !!e.multi_cc,
-        };
-      }
-      await salvarColaboradoresResumo(numEmp, competencia, colaboradoresResumo);
-
       const nomeEmpresa = EMPRESAS.find((emp) => emp.numEmp === numEmp)?.nome || `empresa ${numEmp}`;
-      await registrarAtividade(
-        (ehFechada ? `⚠ Competência fechada ${competencia} (${nomeEmpresa}) foi SOBRESCRITA por ${user?.nome || 'admin'}. ` : `Conferência de ${competencia} (${nomeEmpresa}) rodada via ${fonte === 'vetorh' ? 'Vetorh' : 'PDF'}: `)
-        + `${colaboradores.length} colaboradores, ${totalExcecoes} exceções em ${Object.keys(todasExcecoes).length} camadas`
-        + (pontoPorMatricula ? ' (com cruzamento de ponto/horas extras)' : ' (sem relatório de ponto — Tiers 5 e 6 não rodaram)')
-        + ` (${alta} de alta confiança no total).`,
-        ehFechada ? 'alerta' : (alta > 0 ? 'alerta' : 'resolvido')
-      );
+      const resultadoConferencia = await rodarEConfirmarConferencia(numEmp, competencia, colaboradores, {
+        pontoPorMatricula, excecoesT7, fonte,
+        origemLabel: `Sincronização manual (${nomeEmpresa}) via ${fonte === 'vetorh' ? 'Vetorh' : 'PDF'} —`,
+        sobrescrita: ehFechada, nomeUsuario: user?.nome || 'admin',
+      });
 
-      setResultado({ colaboradores: colaboradores.length, proventos, liquido, excecoes: totalExcecoes, alta, comHE: !!pontoPorMatricula });
+      setResultado(resultadoConferencia);
       setStatus('concluido');
       setStatusExistente('em_conferencia');
     } catch (e) {
@@ -837,7 +854,12 @@ function UploadScreen({ user, numEmp }) {
 
   return (
     <div>
-      <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Nova Conferência</div><h1 style={s.pageTitle}>Subir folha de pagamento</h1></div></div>
+      <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Sincronização Manual</div><h1 style={s.pageTitle}>Forçar sincronização ou subir PDF</h1></div></div>
+      <div style={{ ...s.panel, marginBottom: 18, background: '#F7F9FA' }}>
+        <div style={{ fontSize: 12.5, color: BRAND.gray, lineHeight: 1.6 }}>
+          O Dashboard já sincroniza sozinho com o Vetorh, sem precisar disso aqui. Essa tela existe pra dois casos: <b>forçar</b> uma nova sincronização de um mês específico agora mesmo (sem esperar o ciclo automático), ou <b>subir um PDF manualmente</b> se a empresa ainda não estiver ligada ao Vetorh (ou se o backend estiver fora do ar).
+        </div>
+      </div>
 
       <div style={s.grid2}>
         <div style={s.panel}>
@@ -883,7 +905,7 @@ function UploadScreen({ user, numEmp }) {
           {fonte === 'vetorh' ? (
             <div style={{ ...s.fileDrop, background: '#E4F6F8', border: '1.5px dashed #8FCFD6', textAlign: 'left' }}>
               <div style={{ fontSize: 13, color: BRAND.deep, fontWeight: 600 }}>
-                Sem arquivo nenhum — ao clicar em "Rodar conferência", busca a folha de {competencia} direto do banco (Vetorh), já filtrada pra essa empresa.
+                Sem arquivo nenhum — ao clicar em "Forçar sincronização", busca a folha de {competencia} direto do banco (Vetorh) agora mesmo, já filtrada pra essa empresa (útil se você não quer esperar o ciclo automático do Dashboard).
               </div>
               <button onClick={() => setMostrarConfigVetorh((v) => !v)} style={{ background: 'none', border: 'none', color: BRAND.deep, fontSize: 11.5, cursor: 'pointer', padding: 0, marginTop: 8, textDecoration: 'underline' }}>
                 {mostrarConfigVetorh ? 'Esconder configuração da conexão' : '⚙ Configurar conexão com o backend'}
@@ -940,11 +962,12 @@ function UploadScreen({ user, numEmp }) {
 
           <button style={{ ...s.btnPrimary, marginTop: 20 }} onClick={rodarConferencia}
             disabled={!podeRodar}>
-            {status === 'lendo' ? `Lendo PDF${progresso ? ` (página ${progresso.p}/${progresso.total})` : ''}…`
+            {status === 'lendo' ? `Lendo${progresso ? ` (página ${progresso.p}/${progresso.total})` : ''}…`
               : status === 'analisando' ? 'Rodando conferência…'
               : ehFechada ? 'Sobrescrever folha fechada'
-              : 'Rodar conferência'}
+              : fonte === 'vetorh' ? 'Forçar sincronização agora' : 'Subir PDF e rodar conferência'}
           </button>
+
 
           {status === 'erro' && <div style={{ ...s.errorText, marginTop: 12 }}>{erro}</div>}
 
