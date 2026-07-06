@@ -58,3 +58,19 @@ export async function resumoEmpresasVetorh(competencia) {
   const r = await chamar(`/api/empresas/resumo/${mes}-${ano}`);
   return r.empresas;
 }
+
+// Série histórica agregada (Centro de Custo x Rubrica x Mês) — o SQL Server
+// já resume, aqui só recebe o resultado compacto. desde/ate são opcionais
+// (formato "MM/AAAA"); sem eles, traz o histórico inteiro.
+export async function historicoRubricaPorCentroCustoVetorh(numEmp, desde, ate) {
+  let caminho = `/api/historico/rubrica-por-centro-custo?empresa=${numEmp}`;
+  if (desde) caminho += `&desde=${desde.replace('/', '-')}`;
+  if (ate) caminho += `&ate=${ate.replace('/', '-')}`;
+  const r = await chamar(caminho);
+  return r.serie;
+}
+
+export async function historicoColaboradorVetorh(numEmp, matricula) {
+  const r = await chamar(`/api/historico/colaborador/${matricula}?empresa=${numEmp}`);
+  return r.historico;
+}

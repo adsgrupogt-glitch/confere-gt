@@ -18,7 +18,8 @@ import { parseRelatorioChefia } from './parser-chefia';
 import { cruzarChefias } from './analytics-chefia';
 import { gerarAlertas } from './insights';
 import { salvarResumoCompetencia, salvarExcecoes, salvarTiers, salvarAnalytics, salvarColaboradoresResumo, salvarEstruturaOrganizacional, lerEstruturaOrganizacional, registrarAtividade, listarCompetencias, lerCompetencia, listarAtividade, fecharCompetencia, excluirCompetencia, atualizarStatusExcecao } from './dados';
-import { getVetorhApiUrl, setVetorhApiUrl, getVetorhApiKey, setVetorhApiKey, listarEmpresasVetorh, listarCompetenciasVetorh, buscarFolhaVetorh } from './vetorh-api';
+import { getVetorhApiUrl, setVetorhApiUrl, getVetorhApiKey, setVetorhApiKey, listarEmpresasVetorh, listarCompetenciasVetorh, buscarFolhaVetorh, historicoRubricaPorCentroCustoVetorh, historicoColaboradorVetorh } from './vetorh-api';
+import { detectarMudancasRubrica, detectarMudancasColaborador } from './analise-historica';
 import { rodarEConfirmarConferencia } from './motor-conferencia';
 
 // As 5 empresas do Grupo GT (espelha o backend — usado só pros rótulos e
@@ -266,6 +267,7 @@ function Sidebar({ user, tela, setTela, onLogout }) {
     { id: 'upload', label: 'Sincronização Manual' },
     { id: 'excecoes', label: 'Exceções' },
     { id: 'chefias', label: 'Chefias & Estrutura' },
+    { id: 'analiseHistorica', label: 'Análise Histórica' },
     { id: 'historico', label: 'Histórico & KPIs' },
     { id: 'assistente', label: 'Assistente IA', badge: 'em breve' },
     { id: 'usuarios', label: 'Usuários' },
@@ -1020,6 +1022,100 @@ function UploadScreen({ user, numEmp }) {
           </p>
         </div>
       </div>
+
+      {user?.admin && <BackfillHistoricoPanel numEmp={numEmp} user={user} />}
+    </div>
+  );
+}
+
+function BackfillHistoricoPanel({ numEmp, user }) {
+  const [status, setStatus] = useState('idle'); // idle | rodando | concluido | erro
+  const [progresso, setProgresso] = useState({ feito: 0, total: 0, atual: '', falhas: [] });
+  const pararRef = useRef(false);
+
+  const iniciarBackfill = async () => {
+    const nomeEmpresa = EMPRESAS.find((e) => e.numEmp === numEmp)?.nome || `empresa ${numEmp}`;
+    if (!window.confirm(`Isso vai copiar TODO o histórico do Vetorh (${nomeEmpresa}) pra dentro do Confere GT — pode levar vários minutos, uma vez só. Meses já sincronizados são pulados. Continuar?`)) return;
+    pararRef.current = false;
+    setStatus('rodando');
+    try {
+      const [competenciasVetorh, jaSincronizadas] = await Promise.all([
+        listarCompetenciasVetorh(numEmp), listarCompetencias(numEmp),
+      ]);
+      const jaSincronizadasSet = new Set(jaSincronizadas);
+      const pendentes = competenciasVetorh.filter((c) => !jaSincronizadasSet.has(c));
+      setProgresso({ feito: 0, total: pendentes.length, atual: '', falhas: [] });
+
+      if (pendentes.length === 0) {
+        setStatus('concluido');
+        return;
+      }
+
+      for (let i = 0; i < pendentes.length; i++) {
+        if (pararRef.current) break;
+        const comp = pendentes[i];
+        setProgresso((p) => ({ ...p, atual: comp }));
+        try {
+          const colaboradores = await buscarFolhaVetorh(numEmp, comp);
+          if (colaboradores?.length > 0) {
+            await rodarEConfirmarConferencia(numEmp, comp, colaboradores, {
+              fonte: 'vetorh', origemLabel: `Cópia única do histórico (${nomeEmpresa}) —`, nomeUsuario: user?.nome || 'admin',
+            });
+          }
+        } catch (e) {
+          setProgresso((p) => ({ ...p, falhas: [...p.falhas, { competencia: comp, erro: e.message }] }));
+        }
+        setProgresso((p) => ({ ...p, feito: i + 1 }));
+        await new Promise((r) => setTimeout(r, 400)); // não martela o SQL Server
+      }
+      setStatus('concluido');
+    } catch (e) {
+      setProgresso((p) => ({ ...p, falhas: [...p.falhas, { competencia: '(geral)', erro: e.message }] }));
+      setStatus('erro');
+    }
+  };
+
+  return (
+    <div style={{ ...s.panel, marginTop: 18, borderLeft: `4px solid ${BRAND.deep}` }}>
+      <div style={s.panelTitle}>Cópia única do histórico completo</div>
+      <p style={{ fontSize: 12.5, color: BRAND.gray, marginBottom: 14, lineHeight: 1.6 }}>
+        Roda uma vez, copia todas as competências que ainda não estão no Confere GT (não repete as que já foram sincronizadas). Pode levar minutos com ~95 meses de histórico — não precisa ficar nessa tela, só não feche o navegador enquanto roda.
+      </p>
+
+      {status === 'idle' && <button style={s.btnPrimary} onClick={iniciarBackfill}>Iniciar cópia única do histórico</button>}
+
+      {status === 'rodando' && (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
+            Sincronizando {progresso.feito} de {progresso.total}... ({progresso.atual})
+          </div>
+          <div style={{ height: 8, background: '#EEF3F5', borderRadius: 4, overflow: 'hidden', marginBottom: 10 }}>
+            <div style={{ height: '100%', width: `${progresso.total ? (progresso.feito / progresso.total) * 100 : 0}%`, background: BRAND.teal, transition: 'width 0.3s' }} />
+          </div>
+          <button style={s.btnGhost} onClick={() => { pararRef.current = true; }}>Parar após o mês atual</button>
+        </div>
+      )}
+
+      {status === 'concluido' && (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, color: BRAND.deep, marginBottom: 8 }}>
+            ✓ Concluído — {progresso.feito} de {progresso.total} meses processados.
+          </div>
+          {progresso.falhas.length > 0 && (
+            <div style={{ fontSize: 12, color: '#D64545' }}>
+              {progresso.falhas.length} falharam: {progresso.falhas.map((f) => f.competencia).join(', ')}. Pode rodar de novo — só reprocessa o que ainda falta.
+            </div>
+          )}
+          <button style={{ ...s.btnSecondary, marginTop: 10 }} onClick={() => setStatus('idle')}>Fechar</button>
+        </div>
+      )}
+
+      {status === 'erro' && (
+        <div>
+          <div style={{ fontSize: 13, color: '#D64545', marginBottom: 8 }}>Algo deu errado: {progresso.falhas[progresso.falhas.length - 1]?.erro}</div>
+          <button style={s.btnSecondary} onClick={() => setStatus('idle')}>Tentar de novo</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1562,6 +1658,148 @@ function ChefiasScreen({ numEmp }) {
   );
 }
 
+const JANELAS_PADRAO = [
+  { label: '3 meses', valor: 3 }, { label: '6 meses', valor: 6 }, { label: '12 meses', valor: 12 },
+  { label: '24 meses', valor: 24 }, { label: 'Todo o histórico', valor: null },
+];
+
+function AnaliseHistoricaScreen({ numEmp }) {
+  const [carregando, setCarregando] = useState(true);
+  const [erro, setErro] = useState(null);
+  const [achados, setAchados] = useState([]);
+  const [todasCompetencias, setTodasCompetencias] = useState([]);
+  const [competenciaRef, setCompetenciaRef] = useState(null); // null = a mais recente
+  const [janela, setJanela] = useState(6); // meses pra trás a partir da referência; null = tudo
+  const [filtro, setFiltro] = useState('todos'); // todos | parou | comecou | buraco
+  const [busca, setBusca] = useState('');
+
+  useEffect(() => {
+    if (!numEmp) return;
+    let cancelado = false;
+    (async () => {
+      try {
+        const competencias = await listarCompetenciasVetorh(numEmp);
+        if (!cancelado) setTodasCompetencias(competencias);
+      } catch (e) {
+        if (!cancelado) setErro(e.message || 'Falha ao buscar competências do Vetorh.');
+      }
+    })();
+    return () => { cancelado = true; };
+  }, [numEmp]);
+
+  const chaveOrd = (c) => { const [m, a] = c.split('/'); return `${a}-${m.padStart(2, '0')}`; };
+  const ordenadas = [...todasCompetencias].sort((a, b) => chaveOrd(b).localeCompare(chaveOrd(a))); // mais recente primeiro
+  const refEfetiva = competenciaRef || ordenadas[0] || null;
+  const idxRef = ordenadas.indexOf(refEfetiva);
+  const desde = janela && idxRef >= 0 ? ordenadas[Math.min(idxRef + janela - 1, ordenadas.length - 1)] : null;
+
+  useEffect(() => {
+    if (!numEmp || !refEfetiva) return;
+    let cancelado = false;
+    setCarregando(true); setErro(null);
+    (async () => {
+      try {
+        const serie = await historicoRubricaPorCentroCustoVetorh(numEmp, desde, refEfetiva);
+        if (cancelado) return;
+        const competenciasNaJanela = janela ? ordenadas.slice(idxRef, idxRef + janela) : ordenadas;
+        const encontrados = detectarMudancasRubrica(serie, competenciasNaJanela);
+        setAchados(encontrados);
+      } catch (e) {
+        if (!cancelado) setErro(e.message || 'Falha ao buscar o histórico do Vetorh.');
+      } finally {
+        if (!cancelado) setCarregando(false);
+      }
+    })();
+    return () => { cancelado = true; };
+  }, [numEmp, refEfetiva, janela]);
+
+  const filtrados = achados
+    .filter((a) => filtro === 'todos' || a.tipo === filtro)
+    .filter((a) => !busca || `${a.nomCCU} ${a.desRub}`.toLowerCase().includes(busca.toLowerCase()));
+
+  const rotuloTipo = { parou: ['⛔ Parou de pagar', '#D64545'], comecou: ['🆕 Começou a pagar', BRAND.blue], buraco: ['⚑ Interrupção no meio', '#C97A1B'] };
+
+  if (ordenadas.length === 0 && !erro) {
+    return <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Análise Histórica</div><h1 style={s.pageTitle}>Buscando competências disponíveis no Vetorh...</h1></div></div>;
+  }
+  if (erro) {
+    return (
+      <div>
+        <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Análise Histórica</div><h1 style={s.pageTitle}>Não consegui carregar</h1></div></div>
+        <div style={s.panel}>{erro}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={s.pageHeader}>
+        <div>
+          <div style={s.pageEyebrow}>Análise Histórica · janela de {janela || 'todo o'} {janela ? 'meses' : 'histórico'}</div>
+          <h1 style={s.pageTitle}>Mudanças de rubrica ao longo do tempo</h1>
+        </div>
+      </div>
+
+      <div style={{ ...s.panel, marginBottom: 18 }}>
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 14 }}>
+          <div>
+            <label style={{ ...s.label, marginBottom: 4 }}>Competência de referência</label>
+            <select style={s.inputText} value={refEfetiva || ''} onChange={(e) => setCompetenciaRef(e.target.value)}>
+              {ordenadas.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{ ...s.label, marginBottom: 4 }}>Cruzar quantos meses pra trás</label>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {JANELAS_PADRAO.map((j) => (
+                <button key={j.label} onClick={() => setJanela(j.valor)} style={{ ...s.pill, ...(janela === j.valor ? s.pillActive : {}) }}>{j.label}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <p style={{ fontSize: 12.5, color: BRAND.gray, lineHeight: 1.6, margin: 0 }}>
+          {carregando ? 'Buscando e cruzando o período selecionado direto do Vetorh...' : (
+            <>Cruzando de <b>{desde || ordenadas[ordenadas.length - 1]}</b> até <b>{refEfetiva}</b> — encontrou <b>{achados.length} mudanças de padrão</b> sozinho: rubricas que começaram a ser pagas, que pararam, ou que tiveram um período de silêncio no meio. É heurístico (materialidade mínima de R$30/mês, silêncio de 3+ meses) — sinaliza pra sua revisão, não afirma que é erro.</>
+          )}
+        </p>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+        <button onClick={() => setFiltro('todos')} style={{ ...s.pill, ...(filtro === 'todos' ? s.pillActive : {}) }}>Todos ({achados.length})</button>
+        <button onClick={() => setFiltro('parou')} style={{ ...s.pill, ...(filtro === 'parou' ? s.pillActive : {}) }}>Parou de pagar ({achados.filter((a) => a.tipo === 'parou').length})</button>
+        <button onClick={() => setFiltro('comecou')} style={{ ...s.pill, ...(filtro === 'comecou' ? s.pillActive : {}) }}>Começou a pagar ({achados.filter((a) => a.tipo === 'comecou').length})</button>
+        <button onClick={() => setFiltro('buraco')} style={{ ...s.pill, ...(filtro === 'buraco' ? s.pillActive : {}) }}>Interrupções ({achados.filter((a) => a.tipo === 'buraco').length})</button>
+        <input style={{ ...s.inputText, maxWidth: 260, marginLeft: 'auto' }} placeholder="Filtrar por centro de custo ou rubrica..." value={busca} onChange={(e) => setBusca(e.target.value)} />
+      </div>
+
+      {filtrados.length === 0 ? (
+        <div style={s.panel}>Nenhuma mudança encontrada com esse filtro.</div>
+      ) : (
+        <div style={s.panel}>
+          <table style={s.table}>
+            <thead><tr><th style={s.th}>Tipo</th><th style={s.th}>Centro de Custo</th><th style={s.th}>Rubrica</th><th style={s.th}>Detalhe</th><th style={s.th}>Média mensal ativo</th></tr></thead>
+            <tbody>
+              {filtrados.map((a, i) => (
+                <tr key={i} style={s.tr}>
+                  <td style={s.td}><span style={{ ...s.tierTag, color: rotuloTipo[a.tipo][1], background: 'transparent', border: `1px solid ${rotuloTipo[a.tipo][1]}` }}>{rotuloTipo[a.tipo][0]}</span></td>
+                  <td style={s.td}>{a.nomCCU || a.codCCU}</td>
+                  <td style={s.td}>{a.desRub}</td>
+                  <td style={{ ...s.td, fontSize: 12 }}>
+                    {a.tipo === 'parou' && <>Última vez pago em <b>{a.ultimaVezPago}</b> — {a.mesesParado} meses sem pagar até hoje (pagou em {a.totalMesesPagos} meses ao todo).</>}
+                    {a.tipo === 'comecou' && <>Começou em <b>{a.comecouEm}</b> — {a.mesesDesdeInicioEmpresa} meses depois do início do histórico dessa empresa.</>}
+                    {a.tipo === 'buraco' && <>Pagou até <b>{a.parouEm}</b>, ficou {a.mesesSemPagar} meses sem pagar, voltou em <b>{a.voltouEm}</b>.</>}
+                  </td>
+                  <td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{fmtBRL(a.mediaMensalQuandoAtivo)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AssistenteScreen() {
   const mensagens = [
     { de: 'voce', texto: 'Quais colaboradores excederam o limite de dobras em maio?' },
@@ -1766,6 +2004,7 @@ export default function ConfereGT() {
             {tela === 'upload' && <UploadScreen user={user} numEmp={numEmp} />}
             {tela === 'excecoes' && <ExcecoesScreen numEmp={numEmp} />}
             {tela === 'chefias' && <ChefiasScreen numEmp={numEmp} />}
+            {tela === 'analiseHistorica' && <AnaliseHistoricaScreen numEmp={numEmp} />}
             {tela === 'historico' && <HistoricoScreen user={user} numEmp={numEmp} />}
             {tela === 'assistente' && <AssistenteScreen />}
             {tela === 'usuarios' && <UsuariosScreen />}
