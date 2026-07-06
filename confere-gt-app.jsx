@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { login as fbLogin, trocarSenha as fbTrocarSenha, garantirUsuariosSeed } from './auth';
-import { extrairTextoLayout, extrairTextoSequencial } from './pdf-texto';
+import { extrairTextoLayout, extrairTextoSequencial } from './extrator-pdf';
 import { parseFolha } from './parser-folha';
 import { parseHorasExtras } from './parser-horas-extras';
 import { tier1Legal } from './regras-tier1';
