@@ -7,7 +7,8 @@ import { tier1cCct } from './regras-tier1c';
 import { calcularAnalytics } from './analytics';
 import { parseRelatorioChefia } from './parser-chefia';
 import { cruzarChefias } from './analytics-chefia';
-import { salvarResumoCompetencia, salvarExcecoes, salvarTiers, salvarAnalytics, salvarColaboradoresResumo, salvarEstruturaOrganizacional, lerEstruturaOrganizacional, registrarAtividade, listarCompetencias, lerCompetencia, listarAtividade, fecharCompetencia, atualizarStatusExcecao } from './dados';
+import { gerarAlertas } from './insights';
+import { salvarResumoCompetencia, salvarExcecoes, salvarTiers, salvarAnalytics, salvarColaboradoresResumo, salvarEstruturaOrganizacional, lerEstruturaOrganizacional, registrarAtividade, listarCompetencias, lerCompetencia, listarAtividade, fecharCompetencia, excluirCompetencia, atualizarStatusExcecao } from './dados';
 import { LineChart, Line, BarChart, Bar, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
 /* ============================================================
@@ -64,8 +65,8 @@ const chaveOrdenavel = (comp) => {
 function useTodasCompetencias() {
   const [estado, setEstado] = useState({ loading: true, erro: null, meses: [] });
 
-  useEffect(() => {
-    let cancelado = false;
+  const carregar = () => {
+    setEstado((s) => ({ ...s, loading: true }));
     (async () => {
       try {
         const competencias = await listarCompetencias();
@@ -74,15 +75,16 @@ function useTodasCompetencias() {
           const d = await lerCompetencia(comp);
           return { competencia: comp, ...d };
         }));
-        if (!cancelado) setEstado({ loading: false, erro: null, meses: dados });
+        setEstado({ loading: false, erro: null, meses: dados });
       } catch (e) {
-        if (!cancelado) setEstado({ loading: false, erro: e.message || 'Falha ao carregar dados do Firebase.', meses: [] });
+        setEstado({ loading: false, erro: e.message || 'Falha ao carregar dados do Firebase.', meses: [] });
       }
     })();
-    return () => { cancelado = true; };
-  }, []);
+  };
 
-  return estado;
+  useEffect(carregar, []);
+
+  return { ...estado, recarregar: carregar };
 }
 
 function Hex({ size = 40, fill = BRAND.blue, stroke, strokeWidth = 0, style }) {
@@ -295,6 +297,7 @@ function ActivityFeed() {
 
 function Dashboard({ competencia, setCompetencia }) {
   const { loading, erro, meses } = useTodasCompetencias();
+  const { dados: estrutura } = useEstruturaOrganizacional();
 
   if (loading) {
     return (
@@ -359,6 +362,35 @@ function Dashboard({ competencia, setCompetencia }) {
   });
   const serieHorasExtras = meses.map((m) => ({ competencia: m.competencia, 'Horas Extras (R$)': m.analytics?.horasExtras?.valorTotal ?? null }));
 
+  const serieComposicao = meses.map((m) => {
+    const an = m.analytics;
+    if (!an) return { competencia: m.competencia };
+    const adicionais = (an.adicionais?.periculosidade || 0) + (an.adicionais?.insalubridade || 0) + (an.adicionais?.adicionalNoturno || 0);
+    const he = an.horasExtras?.valorTotal || 0;
+    const beneficios = (an.beneficios?.va || 0) + (an.beneficios?.vt || 0);
+    const proventos = an.financeiro?.proventos || 0;
+    const demais = Math.max(proventos - adicionais - he - beneficios, 0);
+    return { competencia: m.competencia, 'Salário base + demais': demais, Adicionais: adicionais, 'Horas Extras': he, Benefícios: beneficios };
+  });
+
+  const idxAtual = meses.findIndex((m) => m.competencia === compAtual);
+  const mesAnteriorObj = idxAtual > 0 ? meses[idxAtual - 1] : null;
+  const delta = (atualVal, antVal) => (atualVal == null || antVal == null || antVal === 0) ? null : ((atualVal - antVal) / Math.abs(antVal)) * 100;
+  const deltaCusto = mesAnteriorObj ? delta(resumo.proventos, mesAnteriorObj.resumo?.proventos) : null;
+  const deltaHeadcount = mesAnteriorObj ? (analytics?.ativos ?? null) - (mesAnteriorObj.analytics?.ativos ?? null) : null;
+  const deltaExcecoes = mesAnteriorObj ? delta(totalAlta, Object.values(mesAnteriorObj.tiers || {}).reduce((s, x) => s + (x.alta || 0), 0)) : null;
+
+  const cruz = estrutura && meses.length > 0
+    ? cruzarChefias(meses.map((m) => ({ competencia: m.competencia, colaboradores: m.colaboradores })), estrutura.localParaChefia, estrutura.chefiasAdministrativas)
+    : null;
+  const alertas = gerarAlertas(meses, cruz);
+
+  const DeltaTag = ({ v, invertido, sufixo = '%', casas = 1 }) => {
+    if (v == null || Number.isNaN(v)) return null;
+    const bom = invertido ? v <= 0 : v >= 0;
+    return <span style={{ fontSize: 11, fontWeight: 700, color: bom ? BRAND.deep : '#D64545', marginLeft: 6 }}>{v > 0 ? '▲' : v < 0 ? '▼' : '—'} {Math.abs(v).toFixed(casas)}{sufixo}</span>;
+  };
+
   return (
     <div>
       <div style={s.pageHeader}>
@@ -381,12 +413,34 @@ function Dashboard({ competencia, setCompetencia }) {
 
       <div style={s.hexRow}>
         <HexKpi label="Colaboradores Ativos" value={fmtNum(analytics?.ativos ?? resumo.colaboradores ?? 0)}
-          sub={analytics ? `${fmtNum(analytics.afastadosTotal)} afastados` : undefined} />
+          sub={<>{analytics ? `${fmtNum(analytics.afastadosTotal)} afastados` : ''}{deltaHeadcount != null && <DeltaTag v={deltaHeadcount} sufixo=" vs mês ant." casas={0} />}</>} />
         <HexKpi label="Custo de Folha" value={fmtBRL(resumo.proventos)}
-          sub={analytics ? `${fmtBRL(analytics.financeiro.custoMedioPorColaborador)} / colaborador` : undefined} />
+          sub={<>{analytics ? `${fmtBRL(analytics.financeiro.custoMedioPorColaborador)} / colaborador` : ''}{deltaCusto != null && <DeltaTag v={deltaCusto} invertido />}</>} />
         <HexKpi label="Líquido Total" value={fmtBRL(resumo.liquido)} tone="good" />
-        <HexKpi label="Exceções Abertas" value={fmtNum(totalExcecoes)} sub={`${totalAlta} de alta confiança`} tone={totalAlta > 0 ? 'danger' : 'good'} />
+        <HexKpi label="Exceções Abertas" value={fmtNum(totalExcecoes)}
+          sub={<>{totalAlta} de alta confiança{deltaExcecoes != null && <DeltaTag v={deltaExcecoes} invertido />}</>} tone={totalAlta > 0 ? 'danger' : 'good'} />
       </div>
+
+      {alertas.length > 0 && (
+        <div style={{ ...s.panel, marginBottom: 18 }}>
+          <div style={s.panelTitle}>🔎 Central de Alertas — {compAtual}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {alertas.map((al, i) => {
+              const cores = { critico: '#D64545', atencao: '#C97A1B', info: BRAND.blue, positivo: BRAND.deep };
+              const icones = { critico: '⛔', atencao: '⚑', info: 'ℹ', positivo: '✓' };
+              return (
+                <div key={i} style={{ display: 'flex', gap: 10, padding: '10px 12px', borderRadius: 8, background: '#F7F9FA', borderLeft: `3px solid ${cores[al.nivel]}` }}>
+                  <div style={{ fontSize: 15 }}>{icones[al.nivel]}</div>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: '#22303A' }}>{al.titulo}</div>
+                    <div style={{ fontSize: 12, color: BRAND.gray, marginTop: 2 }}>{al.detalhe}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {analytics && (
         <div style={s.hexRow}>
@@ -396,6 +450,34 @@ function Dashboard({ competencia, setCompetencia }) {
           <HexKpi label="Horas Extras Pagas" value={fmtBRL(analytics.horasExtras.valorTotal)} sub={`${fmtNum(analytics.horasExtras.colaboradoresComHE)} colaboradores`} />
         </div>
       )}
+
+      <div style={s.grid2}>
+        <div style={s.panel}>
+          <div style={s.panelTitle}>Para onde vai o dinheiro — composição do custo (série)</div>
+          <div style={{ width: '100%', height: 220 }}>
+            <ResponsiveContainer>
+              <AreaChart data={serieComposicao} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#EEF3F5" />
+                <XAxis dataKey="competencia" tick={{ fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => `${(v / 1000).toFixed(0)}k`} />
+                <Tooltip formatter={(v) => fmtBRL(v)} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Area type="monotone" dataKey="Salário base + demais" stackId="1" stroke={BRAND.gray} fill={BRAND.gray} fillOpacity={0.25} connectNulls />
+                <Area type="monotone" dataKey="Adicionais" stackId="1" stroke={BRAND.teal} fill={BRAND.teal} fillOpacity={0.45} connectNulls />
+                <Area type="monotone" dataKey="Horas Extras" stackId="1" stroke="#C97A1B" fill="#C97A1B" fillOpacity={0.45} connectNulls />
+                <Area type="monotone" dataKey="Benefícios" stackId="1" stroke={BRAND.blue} fill={BRAND.blue} fillOpacity={0.45} connectNulls />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+          <p style={{ fontSize: 11, color: BRAND.gray, marginTop: 8 }}>"Salário base + demais" é o resíduo (proventos menos as três fatias rastreadas) — inclui salário base, 13º, férias e rubricas não categorizadas aqui.</p>
+        </div>
+        <div style={s.panel}>
+          <div style={s.panelTitle}>Exceções por camada de verificação</div>
+          {Object.keys(tiersTotais).length > 0
+            ? <SeverityPanel tiers={tiersTotais} alta={tiersAlta} />
+            : <div style={{ fontSize: 12.5, color: BRAND.gray }}>Sem exceções calculadas para este mês.</div>}
+        </div>
+      </div>
 
       <div style={s.grid2}>
         <div style={s.panel}>
@@ -415,10 +497,20 @@ function Dashboard({ competencia, setCompetencia }) {
           </div>
         </div>
         <div style={s.panel}>
-          <div style={s.panelTitle}>Exceções por camada de verificação</div>
-          {Object.keys(tiersTotais).length > 0
-            ? <SeverityPanel tiers={tiersTotais} alta={tiersAlta} />
-            : <div style={{ fontSize: 12.5, color: BRAND.gray }}>Sem exceções calculadas para este mês.</div>}
+          <div style={s.panelTitle}>Headcount por status detalhado ({compAtual})</div>
+          {analytics?.headcountPorStatus?.length > 0 ? (
+            <table style={s.table}>
+              <thead><tr><th style={s.th}>Status</th><th style={s.th}>Colaboradores</th></tr></thead>
+              <tbody>
+                {[...analytics.headcountPorStatus].sort((a, b) => b.quantidade - a.quantidade).map((h) => (
+                  <tr key={h.status} style={s.tr}>
+                    <td style={s.td}>{h.status}</td>
+                    <td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{h.quantidade}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : <div style={{ fontSize: 12.5, color: BRAND.gray }}>Sem detalhamento de status para este mês (reprocesse a competência).</div>}
         </div>
       </div>
 
@@ -558,8 +650,13 @@ function Dashboard({ competencia, setCompetencia }) {
   );
 }
 
+const MESES_LABEL = ['01 - Janeiro', '02 - Fevereiro', '03 - Março', '04 - Abril', '05 - Maio', '06 - Junho', '07 - Julho', '08 - Agosto', '09 - Setembro', '10 - Outubro', '11 - Novembro', '12 - Dezembro'];
+
 function UploadScreen({ user }) {
-  const [competencia, setCompetencia] = useState('07/2026');
+  const agora = new Date();
+  const [mes, setMes] = useState(String(agora.getMonth() + 1).padStart(2, '0'));
+  const [ano, setAno] = useState(agora.getFullYear());
+  const competencia = `${mes}/${ano}`;
   const [arquivo, setArquivo] = useState(null);
   const [status, setStatus] = useState('idle'); // idle | lendo | analisando | concluido | erro
   const [progresso, setProgresso] = useState(null);
@@ -569,6 +666,7 @@ function UploadScreen({ user }) {
   const [confirmaSobrescrita, setConfirmaSobrescrita] = useState(false);
   const [fechando, setFechando] = useState(false);
   const [fechada, setFechada] = useState(false);
+  const [excluindo, setExcluindo] = useState(false);
 
   useEffect(() => {
     let cancelado = false;
@@ -585,6 +683,20 @@ function UploadScreen({ user }) {
   const ehFechada = statusExistente === 'fechada';
   const podeRodar = !!arquivo && status !== 'lendo' && status !== 'analisando'
     && (!ehFechada || (user?.admin && confirmaSobrescrita));
+
+  const excluirEstaCompetencia = async () => {
+    if (!window.confirm(`Excluir TODOS os dados de ${competencia} (resumo, exceções, analytics)? Essa ação não pode ser desfeita.`)) return;
+    setExcluindo(true);
+    try {
+      await excluirCompetencia(competencia);
+      await registrarAtividade(`Competência ${competencia} excluída por ${user?.nome || 'admin'} (limpeza de dado incorreto/duplicado).`, 'alerta');
+      setStatusExistente('inexistente');
+    } catch (e) {
+      setErro('Não consegui excluir: ' + (e.message || ''));
+    } finally {
+      setExcluindo(false);
+    }
+  };
 
   const rodarConferencia = async () => {
     if (!arquivo) return;
@@ -671,8 +783,23 @@ function UploadScreen({ user }) {
       <div style={s.grid2}>
         <div style={s.panel}>
           <label style={s.label}>Competência</label>
-          <input style={{ ...s.inputText, marginBottom: 8 }} value={competencia}
-            onChange={(e) => setCompetencia(e.target.value)} placeholder="07/2026" />
+          <div style={{ display: 'flex', gap: 10, marginBottom: 6 }}>
+            <select style={{ ...s.inputText, flex: 2 }} value={mes} onChange={(e) => setMes(e.target.value)}>
+              {MESES_LABEL.map((m, i) => <option key={m} value={String(i + 1).padStart(2, '0')}>{m}</option>)}
+            </select>
+            <select style={{ ...s.inputText, flex: 1 }} value={ano} onChange={(e) => setAno(Number(e.target.value))}>
+              {Array.from({ length: 6 }, (_, i) => agora.getFullYear() - 2 + i).map((a) => <option key={a} value={a}>{a}</option>)}
+            </select>
+          </div>
+          <div style={{ fontSize: 11.5, color: BRAND.gray, marginBottom: 8 }}>
+            {statusExistente === 'checando' ? 'Checando...' : statusExistente === 'inexistente' ? `${competencia} ainda não tem dados salvos.` : `${competencia} já existe (status: ${statusExistente}).`}
+          </div>
+          {user?.admin && statusExistente && statusExistente !== 'inexistente' && statusExistente !== 'checando' && (
+            <button onClick={excluirEstaCompetencia} disabled={excluindo}
+              style={{ background: 'none', border: 'none', color: '#D64545', fontSize: 11.5, cursor: 'pointer', padding: 0, marginBottom: 14, textDecoration: 'underline' }}>
+              {excluindo ? 'Excluindo...' : `🗑 Excluir todos os dados de ${competencia} (admin)`}
+            </button>
+          )}
 
           {ehFechada && (
             <div style={{ background: '#FDECEC', border: '1px solid #F3B4B4', borderRadius: 8, padding: '10px 12px', marginBottom: 14, fontSize: 12.5, color: '#8C2A2A' }}>
@@ -900,12 +1027,19 @@ function ExcecoesScreen() {
   );
 }
 
-function HistoricoScreen() {
-  const { loading, erro, meses } = useTodasCompetencias();
+function HistoricoScreen({ user }) {
+  const { loading, erro, meses, recarregar } = useTodasCompetencias();
 
   if (loading) return <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Série Mensal</div><h1 style={s.pageTitle}>Carregando...</h1></div></div>;
   if (erro) return <div style={s.panel}>{erro}</div>;
   if (meses.length === 0) return <div style={s.panel}>Nenhuma competência processada ainda.</div>;
+
+  const excluir = async (competencia) => {
+    if (!window.confirm(`Excluir TODOS os dados de "${competencia}"? Essa ação não pode ser desfeita.`)) return;
+    await excluirCompetencia(competencia);
+    await registrarAtividade(`Competência "${competencia}" excluída por ${user?.nome || 'admin'} (limpeza via Histórico).`, 'alerta');
+    recarregar();
+  };
 
   const serie = meses.map((m) => {
     const t = m.tiers || {};
@@ -962,7 +1096,7 @@ function HistoricoScreen() {
       <div style={{ ...s.panel, marginTop: 18 }}>
         <div style={s.panelTitle}>Evolução mês a mês</div>
         <table style={s.table}>
-          <thead><tr><th style={s.th}>Competência</th><th style={s.th}>Colaboradores</th><th style={s.th}>Proventos</th><th style={s.th}>Líquido</th><th style={s.th}>Exceções (alta)</th><th style={s.th}>Status</th></tr></thead>
+          <thead><tr><th style={s.th}>Competência</th><th style={s.th}>Colaboradores</th><th style={s.th}>Proventos</th><th style={s.th}>Líquido</th><th style={s.th}>Exceções (alta)</th><th style={s.th}>Status</th>{user?.admin && <th style={s.th}></th>}</tr></thead>
           <tbody>
             {serie.map((m) => (
               <tr key={m.competencia} style={s.tr}>
@@ -973,9 +1107,14 @@ function HistoricoScreen() {
                 <td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace', color: m.alta > 0 ? '#D64545' : '#33414D' }}>{m.alta} / {m.total}</td>
                 <td style={s.td}>
                   <span style={{ ...s.statusChip, color: m.status === 'fechada' ? BRAND.deep : '#D64545', borderColor: m.status === 'fechada' ? BRAND.deep : '#D64545' }}>
-                    {m.status === 'fechada' ? 'Fechada' : 'Em conferência'}
+                    {m.status === 'fechada' ? 'Fechada' : m.status || 'incompleta'}
                   </span>
                 </td>
+                {user?.admin && (
+                  <td style={s.td}>
+                    <button onClick={() => excluir(m.competencia)} style={{ background: 'none', border: 'none', color: '#D64545', cursor: 'pointer', fontSize: 12 }} title="Excluir competência">🗑</button>
+                  </td>
+                )}
               </tr>
             ))}
           </tbody>
@@ -1400,7 +1539,7 @@ export default function ConfereGT() {
             {tela === 'upload' && <UploadScreen user={user} />}
             {tela === 'excecoes' && <ExcecoesScreen />}
             {tela === 'chefias' && <ChefiasScreen />}
-            {tela === 'historico' && <HistoricoScreen />}
+            {tela === 'historico' && <HistoricoScreen user={user} />}
             {tela === 'assistente' && <AssistenteScreen />}
             {tela === 'usuarios' && <UsuariosScreen />}
           </div>

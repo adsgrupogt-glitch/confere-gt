@@ -9,7 +9,7 @@
 //
 // /usuarios/{login}                 -> ver auth.js
 
-import { ref, get, set, update, push } from 'firebase/database';
+import { ref, get, set, update, remove, push } from 'firebase/database';
 import { db } from './firebase-config';
 
 const chaveComp = (competencia) => competencia.replace('/', '-'); // "06/2026" -> "06-2026"
@@ -37,13 +37,35 @@ export async function salvarColaboradoresResumo(competencia, mapaMatriculaInfo) 
 // Estrutura organizacional (Local/Posto -> Chefia) extraída do Relatório de
 // Chefia (FPRE120). É um snapshot no tempo — atualiza quando você sobe um
 // relatório novo. Fica fora de /folhas porque não pertence a uma competência.
-export async function salvarEstruturaOrganizacional(dados) {
-  await set(ref(db, 'estruturaOrganizacional'), { ...dados, atualizadoEm: new Date().toISOString() });
+// Estrutura organizacional (Local/Posto -> Chefia) extraída do Relatório de
+// Chefia (FPRE120). É um snapshot no tempo — atualiza quando você sobe um
+// relatório novo. Fica fora de /folhas porque não pertence a uma competência.
+//
+// IMPORTANTE: nomes de posto/chefia viram texto livre com ".", "/" etc.
+// (ex: "Cond. X - Port/Zel/Limp"), e essas são chaves proibidas no Realtime
+// Database. Por isso guardamos como LISTA de pares, nunca como objeto
+// chaveado pelo nome — e reconstruímos o objeto de lookup na leitura.
+export async function salvarEstruturaOrganizacional(dadosEstrutura) {
+  const localParaChefiaLista = Object.entries(dadosEstrutura.localParaChefia).map(([local, chefia]) => ({ local, chefia }));
+  const locaisPorChefiaLista = Object.entries(dadosEstrutura.locaisPorChefia).map(([chefia, locais]) => ({ chefia, locais }));
+  await set(ref(db, 'estruturaOrganizacional'), {
+    localParaChefiaLista, locaisPorChefiaLista,
+    chefiasAdministrativas: dadosEstrutura.chefiasAdministrativas,
+    totalChefias: dadosEstrutura.totalChefias,
+    totalLocais: dadosEstrutura.totalLocais,
+    atualizadoEm: new Date().toISOString(),
+  });
 }
 
 export async function lerEstruturaOrganizacional() {
   const snap = await get(ref(db, 'estruturaOrganizacional'));
-  return snap.exists() ? snap.val() : null;
+  if (!snap.exists()) return null;
+  const v = snap.val();
+  const localParaChefia = {};
+  (v.localParaChefiaLista || []).forEach(({ local, chefia }) => { localParaChefia[local] = chefia; });
+  const locaisPorChefia = {};
+  (v.locaisPorChefiaLista || []).forEach(({ chefia, locais }) => { locaisPorChefia[chefia] = locais; });
+  return { ...v, localParaChefia, locaisPorChefia };
 }
 
 export async function salvarExcecoes(competencia, tier, lista) {
@@ -63,6 +85,14 @@ export async function listarCompetencias() {
 
 export async function fecharCompetencia(competencia) {
   await update(ref(db, `folhas/${chaveComp(competencia)}/resumo`), { status: 'fechada' });
+}
+
+// Apaga uma competência inteira do Firebase — usado pra limpar entradas
+// inválidas/duplicadas (ex: competência digitada errado, ou conferência que
+// falhou no meio e deixou nó incompleto). Irreversível, por isso é admin-only
+// na UI e sempre pede confirmação antes de chamar.
+export async function excluirCompetencia(competencia) {
+  await remove(ref(db, `folhas/${chaveComp(competencia)}`));
 }
 
 export async function atualizarStatusExcecao(competencia, tier, idExcecao, novoStatus, parecer) {

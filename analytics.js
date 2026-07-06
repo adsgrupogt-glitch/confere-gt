@@ -97,7 +97,7 @@ export function calcularAnalytics(colaboradores, periodoInicio, periodoFim) {
 
   return {
     colaboradores: colaboradores.length,
-    headcountPorStatus,
+    headcountPorStatus: Object.entries(headcountPorStatus).map(([status, quantidade]) => ({ status, quantidade })),
     ativos,
     afastadosTotal,
     demitidos,
