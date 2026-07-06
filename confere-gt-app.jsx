@@ -1,9 +1,15 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { login as fbLogin, trocarSenha as fbTrocarSenha, garantirUsuariosSeed } from './auth';
-import { extrairTextoLayout } from './pdf-texto';
+import { extrairTextoLayout, extrairTextoSequencial } from './pdf-texto';
 import { parseFolha } from './parser-folha';
+import { parseHorasExtras } from './parser-horas-extras';
 import { tier1Legal } from './regras-tier1';
 import { tier1cCct } from './regras-tier1c';
+import { tier1dVigia } from './regras-tier1d';
+import { tier1ePisoRegional } from './regras-tier1e';
+import { tier2ConsistenciaPares } from './regras-tier2';
+import { tier5HorasExtras } from './regras-tier5';
+import { tier6Dobras } from './regras-tier6';
 import { calcularAnalytics } from './analytics';
 import { parseRelatorioChefia } from './parser-chefia';
 import { cruzarChefias } from './analytics-chefia';
@@ -658,6 +664,7 @@ function UploadScreen({ user }) {
   const [ano, setAno] = useState(agora.getFullYear());
   const competencia = `${mes}/${ano}`;
   const [arquivo, setArquivo] = useState(null);
+  const [arquivoHE, setArquivoHE] = useState(null);
   const [status, setStatus] = useState('idle'); // idle | lendo | analisando | concluido | erro
   const [progresso, setProgresso] = useState(null);
   const [resultado, setResultado] = useState(null);
@@ -714,12 +721,26 @@ function UploadScreen({ user }) {
       const [mesStr, anoStr] = competencia.split('/');
       const periodoInicio = new Date(parseInt(anoStr, 10), parseInt(mesStr, 10) - 1, 1);
       const periodoFim = new Date(parseInt(anoStr, 10), parseInt(mesStr, 10), 0);
+
+      let pontoPorMatricula = null;
+      if (arquivoHE) {
+        const bufferHE = await arquivoHE.arrayBuffer();
+        const textoHE = await extrairTextoSequencial(bufferHE);
+        pontoPorMatricula = parseHorasExtras(textoHE);
+      }
+
       const excecoesT1 = tier1Legal(colaboradores, periodoInicio, competencia);
       const excecoesT1c = tier1cCct(colaboradores, periodoInicio, competencia);
-      const altaT1 = excecoesT1.filter((x) => x.confianca === 'alta').length;
-      const altaT1c = excecoesT1c.filter((x) => x.confianca === 'alta').length;
-      const alta = altaT1 + altaT1c;
-      const totalExcecoes = excecoesT1.length + excecoesT1c.length;
+      const excecoesT1d = tier1dVigia(colaboradores, competencia);
+      const excecoesT1e = tier1ePisoRegional(colaboradores, competencia);
+      const excecoesT2 = tier2ConsistenciaPares(colaboradores, competencia);
+      const colaboradoresPorMatricula = Object.fromEntries(colaboradores.map((e) => [e.matricula, e]));
+      const excecoesT5 = pontoPorMatricula ? tier5HorasExtras(colaboradores, pontoPorMatricula, competencia) : [];
+      const excecoesT6 = pontoPorMatricula ? tier6Dobras(pontoPorMatricula, colaboradoresPorMatricula, competencia) : [];
+
+      const todasExcecoes = { t1: excecoesT1, t1c: excecoesT1c, t1d: excecoesT1d, t1e: excecoesT1e, t2: excecoesT2, t5: excecoesT5, t6: excecoesT6 };
+      const alta = Object.values(todasExcecoes).reduce((s, arr) => s + arr.filter((x) => x.confianca === 'alta').length, 0);
+      const totalExcecoes = Object.values(todasExcecoes).reduce((s, arr) => s + arr.length, 0);
       const analytics = calcularAnalytics(colaboradores, periodoInicio, periodoFim);
 
       const proventos = colaboradores.reduce((s, e) => s + (e.totais.proventos || 0), 0);
@@ -728,13 +749,14 @@ function UploadScreen({ user }) {
 
       await salvarResumoCompetencia(competencia, {
         status: 'em_conferencia', colaboradores: colaboradores.length, proventos, descontos, liquido,
+        temHorasExtras: !!pontoPorMatricula,
       });
-      await salvarExcecoes(competencia, 't1', excecoesT1);
-      await salvarExcecoes(competencia, 't1c', excecoesT1c);
-      await salvarTiers(competencia, {
-        t1: { total: excecoesT1.length, alta: altaT1 },
-        t1c: { total: excecoesT1c.length, alta: altaT1c },
-      });
+      const tiersParaSalvar = {};
+      for (const [tier, arr] of Object.entries(todasExcecoes)) {
+        await salvarExcecoes(competencia, tier, arr);
+        tiersParaSalvar[tier] = { total: arr.length, alta: arr.filter((x) => x.confianca === 'alta').length };
+      }
+      await salvarTiers(competencia, tiersParaSalvar);
       await salvarAnalytics(competencia, analytics);
 
       const colaboradoresResumo = {};
@@ -748,12 +770,13 @@ function UploadScreen({ user }) {
 
       await registrarAtividade(
         (ehFechada ? `⚠ Competência fechada ${competencia} foi SOBRESCRITA por ${user?.nome || 'admin'}. ` : `Conferência de ${competencia} rodada: `)
-        + `${colaboradores.length} colaboradores, ${excecoesT1.length} exceções em INSS/FGTS/VT e ${excecoesT1c.length} em Periculosidade/Insalubridade `
-        + `(${alta} de alta confiança no total).`,
+        + `${colaboradores.length} colaboradores, ${totalExcecoes} exceções em ${Object.keys(todasExcecoes).length} camadas`
+        + (pontoPorMatricula ? ' (com cruzamento de ponto/horas extras)' : ' (sem relatório de ponto — Tiers 5 e 6 não rodaram)')
+        + ` (${alta} de alta confiança no total).`,
         ehFechada ? 'alerta' : (alta > 0 ? 'alerta' : 'resolvido')
       );
 
-      setResultado({ colaboradores: colaboradores.length, proventos, liquido, excecoes: totalExcecoes, alta });
+      setResultado({ colaboradores: colaboradores.length, proventos, liquido, excecoes: totalExcecoes, alta, comHE: !!pontoPorMatricula });
       setStatus('concluido');
       setStatusExistente('em_conferencia');
     } catch (e) {
@@ -824,6 +847,15 @@ function UploadScreen({ user }) {
             </div>
           </div>
 
+          <label style={s.label}>Relatório de Horas Extras / Ponto <span style={{ fontWeight: 400, color: BRAND.gray }}>(opcional — habilita Tiers 5 e 6)</span></label>
+          <div style={s.fileDrop}>
+            <input type="file" accept="application/pdf" style={s.fileInput}
+              onChange={(e) => setArquivoHE(e.target.files[0] || null)} />
+            <div style={{ fontSize: 13, color: arquivoHE ? '#1A2B38' : BRAND.gray, fontWeight: arquivoHE ? 600 : 400 }}>
+              {arquivoHE ? `📄 ${arquivoHE.name}` : 'Clique ou arraste o PDF do ponto aqui (sem isso, Horas Extras e Dobras não são checadas)'}
+            </div>
+          </div>
+
           <button style={{ ...s.btnPrimary, marginTop: 20 }} onClick={rodarConferencia}
             disabled={!podeRodar}>
             {status === 'lendo' ? `Lendo PDF${progresso ? ` (página ${progresso.p}/${progresso.total})` : ''}…`
@@ -840,7 +872,10 @@ function UploadScreen({ user }) {
               <div style={s.resultRow}><span>Colaboradores processados</span><b>{fmtNum(resultado.colaboradores)}</b></div>
               <div style={s.resultRow}><span>Proventos</span><b>{fmtBRL(resultado.proventos)}</b></div>
               <div style={s.resultRow}><span>Líquido</span><b>{fmtBRL(resultado.liquido)}</b></div>
-              <div style={s.resultRow}><span>Exceções (INSS/FGTS/VT + Periculosidade/Insalubridade)</span><b style={{ color: resultado.alta > 0 ? '#D64545' : BRAND.deep }}>{resultado.excecoes} ({resultado.alta} de alta confiança)</b></div>
+              <div style={s.resultRow}><span>Exceções (todas as camadas ativas)</span><b style={{ color: resultado.alta > 0 ? '#D64545' : BRAND.deep }}>{resultado.excecoes} ({resultado.alta} de alta confiança)</b></div>
+              {!resultado.comHE && (
+                <div style={{ fontSize: 11.5, color: '#C97A1B', marginTop: 6 }}>⚑ Sem relatório de ponto nesta rodada — Horas Extras (Tier 5) e Dobras (Tier 6) não foram checadas.</div>
+              )}
               <div style={{ fontSize: 11.5, color: BRAND.gray, marginTop: 10, lineHeight: 1.5 }}>
                 Salvo no Firebase em <code>folhas/{competencia.replace('/', '-')}</code>. Consulte a aba Exceções para o detalhe linha a linha.
               </div>
@@ -861,16 +896,16 @@ function UploadScreen({ user }) {
 
         <div style={s.panel}>
           <div style={s.panelTitle}>O que já roda de verdade</div>
-          {['t1', 't1c'].map((k) => (
+          {Object.entries(TIER_META).map(([k, t]) => (
             <div key={k} style={s.checklistRow}>
               <Hex size={16} fill={BRAND.teal} />
-              <div><div style={{ fontSize: 13, fontWeight: 600 }}>{TIER_META[k].label}</div><div style={{ fontSize: 11.5, color: BRAND.gray }}>{TIER_META[k].desc} — ativo, rodando no seu navegador</div></div>
-            </div>
-          ))}
-          {Object.entries(TIER_META).filter(([k]) => k !== 't1' && k !== 't1c').map(([k, t]) => (
-            <div key={k} style={{ ...s.checklistRow, opacity: 0.5 }}>
-              <Hex size={16} fill="none" stroke={BRAND.gray} strokeWidth={4} />
-              <div><div style={{ fontSize: 13, fontWeight: 600 }}>{t.label}</div><div style={{ fontSize: 11.5, color: BRAND.gray }}>{t.desc} — em portagem, ainda roda só no motor Python</div></div>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{t.label}</div>
+                <div style={{ fontSize: 11.5, color: BRAND.gray }}>
+                  {t.desc} — ativo, rodando no seu navegador
+                  {(k === 't5' || k === 't6') && ' (precisa do Relatório de Horas Extras/Ponto no upload)'}
+                </div>
+              </div>
             </div>
           ))}
           <p style={{ fontSize: 12, color: BRAND.gray, marginTop: 16, lineHeight: 1.6 }}>
