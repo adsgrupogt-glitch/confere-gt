@@ -18,6 +18,17 @@ import { parseRelatorioChefia } from './parser-chefia';
 import { cruzarChefias } from './analytics-chefia';
 import { gerarAlertas } from './insights';
 import { salvarResumoCompetencia, salvarExcecoes, salvarTiers, salvarAnalytics, salvarColaboradoresResumo, salvarEstruturaOrganizacional, lerEstruturaOrganizacional, registrarAtividade, listarCompetencias, lerCompetencia, listarAtividade, fecharCompetencia, excluirCompetencia, atualizarStatusExcecao } from './dados';
+import { getVetorhApiUrl, setVetorhApiUrl, getVetorhApiKey, setVetorhApiKey, listarEmpresasVetorh, listarCompetenciasVetorh, buscarFolhaVetorh } from './vetorh-api';
+
+// As 5 empresas do Grupo GT (espelha o backend — usado só pros rótulos e
+// pro seletor; a filtragem de verdade acontece no backend/banco).
+const EMPRESAS = [
+  { numEmp: 30, nome: 'RG Serviços', ativa: true },
+  { numEmp: 40, nome: 'GT Vig', ativa: true },
+  { numEmp: 50, nome: 'GT Cred', ativa: true },
+  { numEmp: 10, nome: 'GT Servi', ativa: false },
+  { numEmp: 20, nome: 'GT Limp', ativa: false },
+];
 import { LineChart, Line, BarChart, Bar, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
 /* ============================================================
@@ -72,17 +83,18 @@ const chaveOrdenavel = (comp) => {
 // Carrega todas as competências já processadas no Firebase (resumo, tiers,
 // analytics) e devolve em ordem cronológica. É a fonte de dado real por trás
 // do Dashboard e do Histórico & KPIs — nada aqui é mock.
-function useTodasCompetencias() {
+function useTodasCompetencias(numEmp) {
   const [estado, setEstado] = useState({ loading: true, erro: null, meses: [] });
 
   const carregar = () => {
+    if (!numEmp) return;
     setEstado((s) => ({ ...s, loading: true }));
     (async () => {
       try {
-        const competencias = await listarCompetencias();
+        const competencias = await listarCompetencias(numEmp);
         const ordenadas = [...competencias].sort((a, b) => chaveOrdenavel(a).localeCompare(chaveOrdenavel(b)));
         const dados = await Promise.all(ordenadas.map(async (comp) => {
-          const d = await lerCompetencia(comp);
+          const d = await lerCompetencia(numEmp, comp);
           return { competencia: comp, ...d };
         }));
         setEstado({ loading: false, erro: null, meses: dados });
@@ -92,7 +104,7 @@ function useTodasCompetencias() {
     })();
   };
 
-  useEffect(carregar, []);
+  useEffect(carregar, [numEmp]);
 
   return { ...estado, recarregar: carregar };
 }
@@ -305,9 +317,9 @@ function ActivityFeed() {
   );
 }
 
-function Dashboard({ competencia, setCompetencia }) {
-  const { loading, erro, meses } = useTodasCompetencias();
-  const { dados: estrutura } = useEstruturaOrganizacional();
+function Dashboard({ competencia, setCompetencia, numEmp }) {
+  const { loading, erro, meses } = useTodasCompetencias(numEmp);
+  const { dados: estrutura } = useEstruturaOrganizacional(numEmp);
 
   if (loading) {
     return (
@@ -663,11 +675,12 @@ function Dashboard({ competencia, setCompetencia }) {
 
 const MESES_LABEL = ['01 - Janeiro', '02 - Fevereiro', '03 - Março', '04 - Abril', '05 - Maio', '06 - Junho', '07 - Julho', '08 - Agosto', '09 - Setembro', '10 - Outubro', '11 - Novembro', '12 - Dezembro'];
 
-function UploadScreen({ user }) {
+function UploadScreen({ user, numEmp }) {
   const agora = new Date();
   const [mes, setMes] = useState(String(agora.getMonth() + 1).padStart(2, '0'));
   const [ano, setAno] = useState(agora.getFullYear());
   const competencia = `${mes}/${ano}`;
+  const [fonte, setFonte] = useState('vetorh'); // 'vetorh' | 'pdf'
   const [arquivo, setArquivo] = useState(null);
   const [arquivoHE, setArquivoHE] = useState(null);
   const [arquivoFerias, setArquivoFerias] = useState(null);
@@ -680,28 +693,31 @@ function UploadScreen({ user }) {
   const [fechando, setFechando] = useState(false);
   const [fechada, setFechada] = useState(false);
   const [excluindo, setExcluindo] = useState(false);
+  const [mostrarConfigVetorh, setMostrarConfigVetorh] = useState(false);
+  const [urlVetorh, setUrlVetorh] = useState(getVetorhApiUrl());
+  const [chaveVetorh, setChaveVetorh] = useState(getVetorhApiKey());
 
   useEffect(() => {
     let cancelado = false;
     setStatusExistente('checando');
     setConfirmaSobrescrita(false);
     setFechada(false);
-    lerCompetencia(competencia).then((d) => {
+    lerCompetencia(numEmp, competencia).then((d) => {
       if (cancelado) return;
       setStatusExistente(d?.resumo?.status || 'inexistente');
     }).catch(() => { if (!cancelado) setStatusExistente('inexistente'); });
     return () => { cancelado = true; };
-  }, [competencia]);
+  }, [numEmp, competencia]);
 
   const ehFechada = statusExistente === 'fechada';
-  const podeRodar = !!arquivo && status !== 'lendo' && status !== 'analisando'
+  const podeRodar = (fonte === 'vetorh' || !!arquivo) && status !== 'lendo' && status !== 'analisando'
     && (!ehFechada || (user?.admin && confirmaSobrescrita));
 
   const excluirEstaCompetencia = async () => {
     if (!window.confirm(`Excluir TODOS os dados de ${competencia} (resumo, exceções, analytics)? Essa ação não pode ser desfeita.`)) return;
     setExcluindo(true);
     try {
-      await excluirCompetencia(competencia);
+      await excluirCompetencia(numEmp, competencia);
       await registrarAtividade(`Competência ${competencia} excluída por ${user?.nome || 'admin'} (limpeza de dado incorreto/duplicado).`, 'alerta');
       setStatusExistente('inexistente');
     } catch (e) {
@@ -712,18 +728,23 @@ function UploadScreen({ user }) {
   };
 
   const rodarConferencia = async () => {
-    if (!arquivo) return;
+    if (fonte === 'pdf' && !arquivo) return;
     if (ehFechada && !user?.admin) { setErro('Esta competência já está fechada. Apenas administradores podem sobrescrevê-la.'); setStatus('erro'); return; }
     if (ehFechada && !confirmaSobrescrita) return;
     setStatus('lendo'); setErro(''); setResultado(null);
     try {
-      const buffer = await arquivo.arrayBuffer();
-      const texto = await extrairTextoLayout(buffer, (p, total) => setProgresso({ p, total }));
+      let colaboradores;
+      if (fonte === 'vetorh') {
+        colaboradores = await buscarFolhaVetorh(numEmp, competencia);
+        if (!colaboradores || colaboradores.length === 0) throw new Error('O Vetorh não retornou nenhum colaborador pra essa empresa/competência. Confirma se o backend está rodando e se essa competência existe (aba "Buscar do Vetorh" já mostra as disponíveis).');
+      } else {
+        const buffer = await arquivo.arrayBuffer();
+        const texto = await extrairTextoLayout(buffer, (p, total) => setProgresso({ p, total }));
+        colaboradores = parseFolha(texto);
+        if (colaboradores.length === 0) throw new Error('Não consegui reconhecer nenhum colaborador neste PDF — confirma se é a Relação de Cálculo do Senior/Rubi.');
+      }
 
       setStatus('analisando');
-      const colaboradores = parseFolha(texto);
-      if (colaboradores.length === 0) throw new Error('Não consegui reconhecer nenhum colaborador neste PDF — confirma se é a Relação de Cálculo do Senior/Rubi.');
-
       const [mesStr, anoStr] = competencia.split('/');
       const periodoInicio = new Date(parseInt(anoStr, 10), parseInt(mesStr, 10) - 1, 1);
       const periodoFim = new Date(parseInt(anoStr, 10), parseInt(mesStr, 10), 0);
@@ -761,17 +782,17 @@ function UploadScreen({ user }) {
       const descontos = colaboradores.reduce((s, e) => s + (e.totais.descontos || 0), 0);
       const liquido = colaboradores.reduce((s, e) => s + (e.totais.liquido || 0), 0);
 
-      await salvarResumoCompetencia(competencia, {
+      await salvarResumoCompetencia(numEmp, competencia, {
         status: 'em_conferencia', colaboradores: colaboradores.length, proventos, descontos, liquido,
-        temHorasExtras: !!pontoPorMatricula,
+        temHorasExtras: !!pontoPorMatricula, fonte,
       });
       const tiersParaSalvar = {};
       for (const [tier, arr] of Object.entries(todasExcecoes)) {
-        await salvarExcecoes(competencia, tier, arr);
+        await salvarExcecoes(numEmp, competencia, tier, arr);
         tiersParaSalvar[tier] = { total: arr.length, alta: arr.filter((x) => x.confianca === 'alta').length };
       }
-      await salvarTiers(competencia, tiersParaSalvar);
-      await salvarAnalytics(competencia, analytics);
+      await salvarTiers(numEmp, competencia, tiersParaSalvar);
+      await salvarAnalytics(numEmp, competencia, analytics);
 
       const colaboradoresResumo = {};
       for (const e of colaboradores) {
@@ -780,10 +801,11 @@ function UploadScreen({ user }) {
           admissao: e.admissao, proventos: e.totais.proventos || 0, multiCC: !!e.multi_cc,
         };
       }
-      await salvarColaboradoresResumo(competencia, colaboradoresResumo);
+      await salvarColaboradoresResumo(numEmp, competencia, colaboradoresResumo);
 
+      const nomeEmpresa = EMPRESAS.find((emp) => emp.numEmp === numEmp)?.nome || `empresa ${numEmp}`;
       await registrarAtividade(
-        (ehFechada ? `⚠ Competência fechada ${competencia} foi SOBRESCRITA por ${user?.nome || 'admin'}. ` : `Conferência de ${competencia} rodada: `)
+        (ehFechada ? `⚠ Competência fechada ${competencia} (${nomeEmpresa}) foi SOBRESCRITA por ${user?.nome || 'admin'}. ` : `Conferência de ${competencia} (${nomeEmpresa}) rodada via ${fonte === 'vetorh' ? 'Vetorh' : 'PDF'}: `)
         + `${colaboradores.length} colaboradores, ${totalExcecoes} exceções em ${Object.keys(todasExcecoes).length} camadas`
         + (pontoPorMatricula ? ' (com cruzamento de ponto/horas extras)' : ' (sem relatório de ponto — Tiers 5 e 6 não rodaram)')
         + ` (${alta} de alta confiança no total).`,
@@ -794,7 +816,7 @@ function UploadScreen({ user }) {
       setStatus('concluido');
       setStatusExistente('em_conferencia');
     } catch (e) {
-      setErro(e.message || 'Algo deu errado ao processar o PDF.');
+      setErro(e.message || 'Algo deu errado ao processar a folha.');
       setStatus('erro');
     }
   };
@@ -802,7 +824,7 @@ function UploadScreen({ user }) {
   const fecharEstaCompetencia = async () => {
     setFechando(true);
     try {
-      await fecharCompetencia(competencia);
+      await fecharCompetencia(numEmp, competencia);
       await registrarAtividade(`Competência ${competencia} fechada por ${user?.nome || 'admin'} — não pode mais ser sobrescrita sem confirmação de administrador.`, 'info');
       setStatusExistente('fechada');
       setFechada(true);
@@ -852,14 +874,51 @@ function UploadScreen({ user }) {
             </label>
           )}
 
-          <label style={s.label}>Relação de Cálculo (PDF do Senior/Rubi)</label>
-          <div style={s.fileDrop}>
-            <input type="file" accept="application/pdf" style={s.fileInput}
-              onChange={(e) => setArquivo(e.target.files[0] || null)} />
-            <div style={{ fontSize: 13, color: arquivo ? '#1A2B38' : BRAND.gray, fontWeight: arquivo ? 600 : 400 }}>
-              {arquivo ? `📄 ${arquivo.name}` : 'Clique ou arraste o PDF aqui'}
-            </div>
+          <label style={s.label}>Fonte de dados</label>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+            <button onClick={() => setFonte('vetorh')} style={{ ...s.pill, ...(fonte === 'vetorh' ? s.pillActive : {}) }}>⚡ Buscar direto do Vetorh</button>
+            <button onClick={() => setFonte('pdf')} style={{ ...s.pill, ...(fonte === 'pdf' ? s.pillActive : {}) }}>📄 Subir PDF</button>
           </div>
+
+          {fonte === 'vetorh' ? (
+            <div style={{ ...s.fileDrop, background: '#E4F6F8', border: '1.5px dashed #8FCFD6', textAlign: 'left' }}>
+              <div style={{ fontSize: 13, color: BRAND.deep, fontWeight: 600 }}>
+                Sem arquivo nenhum — ao clicar em "Rodar conferência", busca a folha de {competencia} direto do banco (Vetorh), já filtrada pra essa empresa.
+              </div>
+              <button onClick={() => setMostrarConfigVetorh((v) => !v)} style={{ background: 'none', border: 'none', color: BRAND.deep, fontSize: 11.5, cursor: 'pointer', padding: 0, marginTop: 8, textDecoration: 'underline' }}>
+                {mostrarConfigVetorh ? 'Esconder configuração da conexão' : '⚙ Configurar conexão com o backend'}
+              </button>
+              {mostrarConfigVetorh && (
+                <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div>
+                    <label style={{ ...s.label, marginBottom: 4 }}>Endereço do backend</label>
+                    <input style={s.inputText} value={urlVetorh} onChange={(e) => setUrlVetorh(e.target.value)} placeholder="http://localhost:3001" />
+                  </div>
+                  <div>
+                    <label style={{ ...s.label, marginBottom: 4 }}>Chave de API (a mesma do .env do backend)</label>
+                    <input style={s.inputText} value={chaveVetorh} onChange={(e) => setChaveVetorh(e.target.value)} placeholder="CONFERE_GT_API_KEY do .env" />
+                  </div>
+                  <button style={{ ...s.btnSecondary, alignSelf: 'flex-start' }} onClick={() => {
+                    setVetorhApiUrl(urlVetorh.trim()); setVetorhApiKey(chaveVetorh.trim()); setMostrarConfigVetorh(false);
+                  }}>Salvar (fica guardado neste navegador)</button>
+                </div>
+              )}
+              <div style={{ fontSize: 11.5, color: BRAND.gray, marginTop: 8 }}>
+                Conectando em: <code>{getVetorhApiUrl()}</code>
+              </div>
+            </div>
+          ) : (
+            <>
+              <label style={s.label}>Relação de Cálculo (PDF do Senior/Rubi)</label>
+              <div style={s.fileDrop}>
+                <input type="file" accept="application/pdf" style={s.fileInput}
+                  onChange={(e) => setArquivo(e.target.files[0] || null)} />
+                <div style={{ fontSize: 13, color: arquivo ? '#1A2B38' : BRAND.gray, fontWeight: arquivo ? 600 : 400 }}>
+                  {arquivo ? `📄 ${arquivo.name}` : 'Clique ou arraste o PDF aqui'}
+                </div>
+              </div>
+            </>
+          )}
 
           <label style={s.label}>Relatório de Horas Extras / Ponto <span style={{ fontWeight: 400, color: BRAND.gray }}>(opcional — habilita Tiers 5 e 6)</span></label>
           <div style={s.fileDrop}>
@@ -1003,8 +1062,8 @@ function DetalheExcecao({ item, onClose, onSalvarStatus }) {
   );
 }
 
-function ExcecoesScreen() {
-  const { loading, erro, meses } = useTodasCompetencias();
+function ExcecoesScreen({ numEmp }) {
+  const { loading, erro, meses } = useTodasCompetencias(numEmp);
   const [competencia, setCompetencia] = useState(null);
   const [tierAtivo, setTierAtivo] = useState('todos');
   const [selecionado, setSelecionado] = useState(null);
@@ -1028,7 +1087,7 @@ function ExcecoesScreen() {
   const statusChip = { revisar: ['A revisar', BRAND.gray], em_correcao: ['Em correção', BRAND.blue], aguardando_rh: ['Aguardando RH', '#D64545'], resolvido: ['Resolvido', BRAND.teal] };
 
   const salvarStatus = async (item, novoStatus, parecer) => {
-    await atualizarStatusExcecao(compAtual, item.tier, String(item.idx), novoStatus, parecer);
+    await atualizarStatusExcecao(numEmp, compAtual, item.tier, String(item.idx), novoStatus, parecer);
     await registrarAtividade(`${item.nome} (${item.matricula}) marcado como "${statusChip[novoStatus]?.[0] || novoStatus}" em ${item.regra}.`, novoStatus === 'resolvido' ? 'resolvido' : 'info');
   };
 
@@ -1153,8 +1212,8 @@ function ExcecoesScreen() {
   );
 }
 
-function HistoricoScreen({ user }) {
-  const { loading, erro, meses, recarregar } = useTodasCompetencias();
+function HistoricoScreen({ user, numEmp }) {
+  const { loading, erro, meses, recarregar } = useTodasCompetencias(numEmp);
 
   if (loading) return <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Série Mensal</div><h1 style={s.pageTitle}>Carregando...</h1></div></div>;
   if (erro) return <div style={s.panel}>{erro}</div>;
@@ -1162,7 +1221,7 @@ function HistoricoScreen({ user }) {
 
   const excluir = async (competencia) => {
     if (!window.confirm(`Excluir TODOS os dados de "${competencia}"? Essa ação não pode ser desfeita.`)) return;
-    await excluirCompetencia(competencia);
+    await excluirCompetencia(numEmp, competencia);
     await registrarAtividade(`Competência "${competencia}" excluída por ${user?.nome || 'admin'} (limpeza via Histórico).`, 'alerta');
     recarregar();
   };
@@ -1250,17 +1309,18 @@ function HistoricoScreen({ user }) {
   );
 }
 
-function useEstruturaOrganizacional() {
+function useEstruturaOrganizacional(numEmp) {
   const [estado, setEstado] = useState({ loading: true, dados: null });
   const recarregar = () => {
+    if (!numEmp) return;
     setEstado((s) => ({ ...s, loading: true }));
-    lerEstruturaOrganizacional().then((d) => setEstado({ loading: false, dados: d })).catch(() => setEstado({ loading: false, dados: null }));
+    lerEstruturaOrganizacional(numEmp).then((d) => setEstado({ loading: false, dados: d })).catch(() => setEstado({ loading: false, dados: null }));
   };
-  useEffect(recarregar, []);
+  useEffect(recarregar, [numEmp]);
   return { ...estado, recarregar };
 }
 
-function UploadEstruturaPanel({ estrutura, onAtualizado }) {
+function UploadEstruturaPanel({ numEmp, estrutura, onAtualizado }) {
   const [arquivo, setArquivo] = useState(null);
   const [status, setStatus] = useState('idle');
   const [erro, setErro] = useState('');
@@ -1273,7 +1333,7 @@ function UploadEstruturaPanel({ estrutura, onAtualizado }) {
       const texto = await extrairTextoLayout(buffer);
       setStatus('processando');
       const r = parseRelatorioChefia(texto);
-      await salvarEstruturaOrganizacional(r);
+      await salvarEstruturaOrganizacional(numEmp, r);
       await registrarAtividade(`Estrutura organizacional atualizada: ${r.totalChefias} chefias, ${r.totalLocais} locais mapeados (${r.chefiasAdministrativas.length} bucket(s) administrativo(s) detectado(s) automaticamente).`, 'info');
       setStatus('ok');
       setArquivo(null);
@@ -1312,9 +1372,9 @@ function UploadEstruturaPanel({ estrutura, onAtualizado }) {
   );
 }
 
-function ChefiasScreen() {
-  const { loading: loadingMeses, erro: erroMeses, meses } = useTodasCompetencias();
-  const { loading: loadingEstrutura, dados: estrutura, recarregar } = useEstruturaOrganizacional();
+function ChefiasScreen({ numEmp }) {
+  const { loading: loadingMeses, erro: erroMeses, meses } = useTodasCompetencias(numEmp);
+  const { loading: loadingEstrutura, dados: estrutura, recarregar } = useEstruturaOrganizacional(numEmp);
   const [mostrarTodasTransf, setMostrarTodasTransf] = useState(false);
 
   if (loadingMeses || loadingEstrutura) {
@@ -1335,7 +1395,7 @@ function ChefiasScreen() {
     <div>
       <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Estrutura Organizacional</div><h1 style={s.pageTitle}>Chefias & Postos</h1></div></div>
 
-      <UploadEstruturaPanel estrutura={estrutura} onAtualizado={recarregar} />
+      <UploadEstruturaPanel numEmp={numEmp} estrutura={estrutura} onAtualizado={recarregar} />
 
       {!estrutura && (
         <div style={{ ...s.panel, marginTop: 18 }}>
@@ -1649,10 +1709,27 @@ const s = {
   chatInput: { flex: 1, background: '#F5F8FA', border: '1px solid #DCE5E9', borderRadius: 8, padding: '11px 14px', color: '#1A2B38', fontSize: 13 },
 };
 
+function EmpresaSwitcher({ numEmp, setNumEmp }) {
+  return (
+    <div style={{ display: 'flex', gap: 6, marginBottom: 18, flexWrap: 'wrap' }}>
+      {EMPRESAS.map((emp) => (
+        <button key={emp.numEmp} onClick={() => setNumEmp(emp.numEmp)}
+          style={{
+            ...s.compBtn, ...(numEmp === emp.numEmp ? s.compBtnActive : {}),
+            opacity: emp.ativa ? 1 : 0.55, border: '1px solid #DCE5E9', padding: '7px 14px',
+          }}>
+          {emp.nome}{!emp.ativa && ' (inativa)'}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export default function ConfereGT() {
   const [user, setUser] = useState(null);
   const [tela, setTela] = useState('dashboard');
   const [competencia, setCompetencia] = useState('06/2026');
+  const [numEmp, setNumEmp] = useState(30); // RG Serviços — a maior, abre por padrão
 
   return (
     <>
@@ -1661,11 +1738,12 @@ export default function ConfereGT() {
         <div style={s.app}>
           <Sidebar user={user.nome} tela={tela} setTela={setTela} onLogout={() => setUser(null)} />
           <div style={s.main}>
-            {tela === 'dashboard' && <Dashboard competencia={competencia} setCompetencia={setCompetencia} user={user} />}
-            {tela === 'upload' && <UploadScreen user={user} />}
-            {tela === 'excecoes' && <ExcecoesScreen />}
-            {tela === 'chefias' && <ChefiasScreen />}
-            {tela === 'historico' && <HistoricoScreen user={user} />}
+            <EmpresaSwitcher numEmp={numEmp} setNumEmp={setNumEmp} />
+            {tela === 'dashboard' && <Dashboard competencia={competencia} setCompetencia={setCompetencia} user={user} numEmp={numEmp} />}
+            {tela === 'upload' && <UploadScreen user={user} numEmp={numEmp} />}
+            {tela === 'excecoes' && <ExcecoesScreen numEmp={numEmp} />}
+            {tela === 'chefias' && <ChefiasScreen numEmp={numEmp} />}
+            {tela === 'historico' && <HistoricoScreen user={user} numEmp={numEmp} />}
             {tela === 'assistente' && <AssistenteScreen />}
             {tela === 'usuarios' && <UsuariosScreen />}
           </div>
