@@ -7,9 +7,9 @@ import { ref, get, set, update } from 'firebase/database';
 import { db } from './firebase-config';
 
 const SEED_ADMINS = {
-  gabriel: { nome: 'Gabriel', papel: 'CEO', senha: '123456', primeiroAcesso: true, ativo: true },
-  juliana: { nome: 'Juliana', papel: 'Administrativo', senha: '123456', primeiroAcesso: true, ativo: true },
-  shay: { nome: 'Shay', papel: 'Operações', senha: '123456', primeiroAcesso: true, ativo: true },
+  gabriel: { nome: 'Gabriel', papel: 'CEO', senha: '123456', primeiroAcesso: true, ativo: true, admin: true },
+  juliana: { nome: 'Juliana', papel: 'Administrativo', senha: '123456', primeiroAcesso: true, ativo: true, admin: true },
+  shay: { nome: 'Shay', papel: 'Operações', senha: '123456', primeiroAcesso: true, ativo: true, admin: true },
 };
 
 // Roda uma vez (ou sempre que subir um usuário novo por código) — só cria quem
@@ -21,6 +21,7 @@ export async function garantirUsuariosSeed() {
   const faltando = {};
   for (const [login, dados] of Object.entries(SEED_ADMINS)) {
     if (!existentes[login]) faltando[login] = dados;
+    else if (existentes[login].admin === undefined) faltando[login] = { ...existentes[login], admin: true };
   }
   if (Object.keys(faltando).length > 0) {
     await update(usuariosRef, faltando);
@@ -52,9 +53,9 @@ export async function listarUsuarios() {
   return Object.entries(snap.val()).map(([login, dados]) => ({ login, ...dados }));
 }
 
-export async function criarUsuario(login, nome, papel) {
+export async function criarUsuario(login, nome, papel, admin = false) {
   await set(ref(db, `usuarios/${login.toLowerCase()}`), {
-    nome, papel, senha: '123456', primeiroAcesso: true, ativo: true,
+    nome, papel, senha: '123456', primeiroAcesso: true, ativo: true, admin,
   });
 }
 

@@ -22,6 +22,30 @@ export async function salvarTiers(competencia, tiers) {
   await set(ref(db, `folhas/${chaveComp(competencia)}/tiers`), tiers);
 }
 
+export async function salvarAnalytics(competencia, analytics) {
+  await set(ref(db, `folhas/${chaveComp(competencia)}/analytics`), analytics);
+}
+
+// Snapshot mensal enxuto por colaborador (não a folha completa) — é o que
+// permite detectar admissão/demissão/transferência/férias mês a mês, cruzado
+// depois com a estrutura organizacional (Chefias). Guardado à parte da
+// conferência legal em si, pra não inflar o nó de exceções.
+export async function salvarColaboradoresResumo(competencia, mapaMatriculaInfo) {
+  await set(ref(db, `folhas/${chaveComp(competencia)}/colaboradores`), mapaMatriculaInfo);
+}
+
+// Estrutura organizacional (Local/Posto -> Chefia) extraída do Relatório de
+// Chefia (FPRE120). É um snapshot no tempo — atualiza quando você sobe um
+// relatório novo. Fica fora de /folhas porque não pertence a uma competência.
+export async function salvarEstruturaOrganizacional(dados) {
+  await set(ref(db, 'estruturaOrganizacional'), { ...dados, atualizadoEm: new Date().toISOString() });
+}
+
+export async function lerEstruturaOrganizacional() {
+  const snap = await get(ref(db, 'estruturaOrganizacional'));
+  return snap.exists() ? snap.val() : null;
+}
+
 export async function salvarExcecoes(competencia, tier, lista) {
   await set(ref(db, `folhas/${chaveComp(competencia)}/excecoes/${tier}`), lista);
 }

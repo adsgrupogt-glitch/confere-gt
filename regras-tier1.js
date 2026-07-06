@@ -33,7 +33,7 @@ const EVENTO_AJUSTE_BASE = '2635';
 const INSS_RELATED = new Set(['2000', '2002', '2004', '2006']); // mensal, férias, 13º, rescisão
 const FGTS_RELATED = new Set(['2500', '1557', '1553']);
 
-function findRubrica(colaborador, cod) {
+export function findRubrica(colaborador, cod) {
   return colaborador.rubricas.find((r) => r.cod === cod) || null;
 }
 
@@ -42,7 +42,7 @@ function cleanSingleBucket(colaborador, codigos) {
   return achados.length === 1;
 }
 
-function fullMonth(colaborador, periodoInicio) {
+export function fullMonth(colaborador, periodoInicio) {
   if (colaborador.status !== 'Trabalhando') return false;
   const [dia, mes, ano] = (colaborador.admissao || '').split('/').map(Number);
   if (!dia || !mes || !ano) return false;
