@@ -10,6 +10,9 @@ import { tier1ePisoRegional } from './regras-tier1e';
 import { tier2ConsistenciaPares } from './regras-tier2';
 import { tier5HorasExtras } from './regras-tier5';
 import { tier6Dobras } from './regras-tier6';
+import { tier7FeriasVencidas } from './regras-tier7';
+import { parseRecibosFerias } from './parser-ferias';
+import { gerarAchados } from './achados';
 import { calcularAnalytics } from './analytics';
 import { parseRelatorioChefia } from './parser-chefia';
 import { cruzarChefias } from './analytics-chefia';
@@ -44,6 +47,7 @@ const TIER_META = {
   t2: { label: 'Consistência de Pares', desc: 'Desvio estatístico dentro do mesmo cargo' },
   t5: { label: 'Horas Extras', desc: 'Cruzamento ponto × folha, exclui banco de horas confirmado' },
   t6: { label: 'Dobras 12x36', desc: 'Limite de 5 dobras/mês — Cláusula 35ª §7º' },
+  t7: { label: 'Férias Vencidas', desc: 'Concessão fora do prazo legal (Art. 134/137 CLT) — risco de pagamento em dobro' },
 };
 
 
@@ -339,6 +343,7 @@ function Dashboard({ competencia, setCompetencia }) {
   const tiersTotais = Object.fromEntries(Object.entries(tiersRaw).map(([k, v]) => [k, v.total]));
   const tiersAlta = Object.fromEntries(Object.entries(tiersRaw).map(([k, v]) => [k, v.alta]));
   const totalExcecoes = Object.values(tiersTotais).reduce((x, y) => x + y, 0);
+  const resultadoAchados = gerarAchados(meses, compAtual);
   const totalAlta = Object.values(tiersAlta).reduce((x, y) => x + y, 0);
   const taxaConferido = resumo.colaboradores ? (((resumo.colaboradores - totalAlta) / resumo.colaboradores) * 100).toFixed(1) : '—';
 
@@ -423,8 +428,8 @@ function Dashboard({ competencia, setCompetencia }) {
         <HexKpi label="Custo de Folha" value={fmtBRL(resumo.proventos)}
           sub={<>{analytics ? `${fmtBRL(analytics.financeiro.custoMedioPorColaborador)} / colaborador` : ''}{deltaCusto != null && <DeltaTag v={deltaCusto} invertido />}</>} />
         <HexKpi label="Líquido Total" value={fmtBRL(resumo.liquido)} tone="good" />
-        <HexKpi label="Exceções Abertas" value={fmtNum(totalExcecoes)}
-          sub={<>{totalAlta} de alta confiança{deltaExcecoes != null && <DeltaTag v={deltaExcecoes} invertido />}</>} tone={totalAlta > 0 ? 'danger' : 'good'} />
+        <HexKpi label="R$ em Risco" value={fmtBRL(resultadoAchados?.valorEmRisco ?? 0)}
+          sub={<>{resultadoAchados?.achados.length ?? 0} achados ({totalExcecoes} itens){deltaExcecoes != null && <DeltaTag v={deltaExcecoes} invertido />}</>} tone={(resultadoAchados?.valorEmRisco ?? 0) > 0 ? 'danger' : 'good'} />
       </div>
 
       {alertas.length > 0 && (
@@ -665,6 +670,7 @@ function UploadScreen({ user }) {
   const competencia = `${mes}/${ano}`;
   const [arquivo, setArquivo] = useState(null);
   const [arquivoHE, setArquivoHE] = useState(null);
+  const [arquivoFerias, setArquivoFerias] = useState(null);
   const [status, setStatus] = useState('idle'); // idle | lendo | analisando | concluido | erro
   const [progresso, setProgresso] = useState(null);
   const [resultado, setResultado] = useState(null);
@@ -729,6 +735,14 @@ function UploadScreen({ user }) {
         pontoPorMatricula = parseHorasExtras(textoHE);
       }
 
+      let excecoesT7 = [];
+      if (arquivoFerias) {
+        const bufferFerias = await arquivoFerias.arrayBuffer();
+        const textoFerias = await extrairTextoLayout(bufferFerias);
+        const recibos = parseRecibosFerias(textoFerias);
+        excecoesT7 = tier7FeriasVencidas(recibos, competencia);
+      }
+
       const excecoesT1 = tier1Legal(colaboradores, periodoInicio, competencia);
       const excecoesT1c = tier1cCct(colaboradores, periodoInicio, competencia);
       const excecoesT1d = tier1dVigia(colaboradores, competencia);
@@ -738,7 +752,7 @@ function UploadScreen({ user }) {
       const excecoesT5 = pontoPorMatricula ? tier5HorasExtras(colaboradores, pontoPorMatricula, competencia) : [];
       const excecoesT6 = pontoPorMatricula ? tier6Dobras(pontoPorMatricula, colaboradoresPorMatricula, competencia) : [];
 
-      const todasExcecoes = { t1: excecoesT1, t1c: excecoesT1c, t1d: excecoesT1d, t1e: excecoesT1e, t2: excecoesT2, t5: excecoesT5, t6: excecoesT6 };
+      const todasExcecoes = { t1: excecoesT1, t1c: excecoesT1c, t1d: excecoesT1d, t1e: excecoesT1e, t2: excecoesT2, t5: excecoesT5, t6: excecoesT6, t7: excecoesT7 };
       const alta = Object.values(todasExcecoes).reduce((s, arr) => s + arr.filter((x) => x.confianca === 'alta').length, 0);
       const totalExcecoes = Object.values(todasExcecoes).reduce((s, arr) => s + arr.length, 0);
       const analytics = calcularAnalytics(colaboradores, periodoInicio, periodoFim);
@@ -856,6 +870,15 @@ function UploadScreen({ user }) {
             </div>
           </div>
 
+          <label style={s.label}>Recibos de Férias do período <span style={{ fontWeight: 400, color: BRAND.gray }}>(opcional — habilita Tier 7, férias vencidas)</span></label>
+          <div style={s.fileDrop}>
+            <input type="file" accept="application/pdf" style={s.fileInput}
+              onChange={(e) => setArquivoFerias(e.target.files[0] || null)} />
+            <div style={{ fontSize: 13, color: arquivoFerias ? '#1A2B38' : BRAND.gray, fontWeight: arquivoFerias ? 600 : 400 }}>
+              {arquivoFerias ? `📄 ${arquivoFerias.name}` : 'Clique ou arraste o lote de Recibos de Férias aqui'}
+            </div>
+          </div>
+
           <button style={{ ...s.btnPrimary, marginTop: 20 }} onClick={rodarConferencia}
             disabled={!podeRodar}>
             {status === 'lendo' ? `Lendo PDF${progresso ? ` (página ${progresso.p}/${progresso.total})` : ''}…`
@@ -904,6 +927,7 @@ function UploadScreen({ user }) {
                 <div style={{ fontSize: 11.5, color: BRAND.gray }}>
                   {t.desc} — ativo, rodando no seu navegador
                   {(k === 't5' || k === 't6') && ' (precisa do Relatório de Horas Extras/Ponto no upload)'}
+                  {k === 't7' && ' (precisa dos Recibos de Férias no upload)'}
                 </div>
               </div>
             </div>
@@ -984,6 +1008,8 @@ function ExcecoesScreen() {
   const [competencia, setCompetencia] = useState(null);
   const [tierAtivo, setTierAtivo] = useState('todos');
   const [selecionado, setSelecionado] = useState(null);
+  const [modo, setModo] = useState('achados'); // 'achados' | 'lista'
+  const [achadoAberto, setAchadoAberto] = useState(null);
 
   if (loading) return <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Exceções</div><h1 style={s.pageTitle}>Carregando...</h1></div></div>;
   if (erro) return <div style={s.panel}>{erro}</div>;
@@ -1006,57 +1032,122 @@ function ExcecoesScreen() {
     await registrarAtividade(`${item.nome} (${item.matricula}) marcado como "${statusChip[novoStatus]?.[0] || novoStatus}" em ${item.regra}.`, novoStatus === 'resolvido' ? 'resolvido' : 'info');
   };
 
+  const resultadoAchados = gerarAchados(meses, compAtual);
+
+  const renderTabela = (linhas) => (
+    <table style={s.table}>
+      <thead><tr><th style={s.th}>Colaborador</th><th style={s.th}>Cargo / Centro de Custo</th><th style={s.th}>Regra</th><th style={s.th}>Diferença</th><th style={s.th}>Confiança</th><th style={s.th}>Status</th></tr></thead>
+      <tbody>
+        {linhas.map((e) => {
+          const chip = statusChip[e.status] || (e.confianca === 'alta' ? statusChip.aguardando_rh : statusChip.revisar);
+          return (
+            <tr key={`${e.tier}-${e.idx}`} style={{ ...s.tr, cursor: 'pointer' }} onClick={() => setSelecionado(e)}>
+              <td style={s.td}>
+                <div style={{ fontWeight: 600 }}>{e.nome} {e.reincidente && <span title="Reincidente vs mês anterior" style={{ fontSize: 10, color: '#D64545' }}>⟲ reincidente</span>}</div>
+                <div style={{ fontSize: 11, color: BRAND.gray, fontFamily: 'IBM Plex Mono, monospace' }}>{e.matricula}</div>
+              </td>
+              <td style={s.td}><div>{e.cargo}</div><div style={{ fontSize: 11, color: BRAND.gray }}>{e.centro_custo}</div></td>
+              <td style={{ ...s.td, maxWidth: 340 }}>{e.regra}</td>
+              <td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace', color: e.diferenca < 0 ? '#D64545' : BRAND.deep }}>
+                {typeof e.diferenca === 'number' ? (Math.abs(e.diferenca) < 100 ? `${e.diferenca.toFixed(2)}h` : fmtBRL(e.diferenca)) : '—'}
+              </td>
+              <td style={s.td}>
+                <span style={{ ...s.statusChip, color: e.confianca === 'alta' ? '#D64545' : BRAND.gray, borderColor: e.confianca === 'alta' ? '#D64545' : BRAND.gray }}>
+                  {e.confianca === 'alta' ? 'Alta' : 'Revisar'}
+                </span>
+              </td>
+              <td style={s.td}><span style={{ ...s.statusChip, color: chip[1], borderColor: chip[1] }}>{chip[0]}</span></td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+
   return (
     <div>
       <div style={s.pageHeader}>
         <div><div style={s.pageEyebrow}>Competência {compAtual}</div><h1 style={s.pageTitle}>Exceções</h1></div>
         <div style={s.compSwitch}>
           {mesesComp.map((c) => (
-            <button key={c} onClick={() => { setCompetencia(c); setTierAtivo('todos'); }} style={{ ...s.compBtn, ...(c === compAtual ? s.compBtnActive : {}) }}>{c}</button>
+            <button key={c} onClick={() => { setCompetencia(c); setTierAtivo('todos'); setAchadoAberto(null); }} style={{ ...s.compBtn, ...(c === compAtual ? s.compBtnActive : {}) }}>{c}</button>
           ))}
         </div>
       </div>
-      <div style={s.pillRow}>
-        <button onClick={() => setTierAtivo('todos')} style={{ ...s.pill, ...(tierAtivo === 'todos' ? s.pillActive : {}) }}>Todas ({lista.length})</button>
-        {Object.entries(TIER_META).map(([k, v]) => {
-          const n = lista.filter((e) => e.tier === k).length;
-          if (!n) return null;
-          return <button key={k} onClick={() => setTierAtivo(k)} style={{ ...s.pill, ...(tierAtivo === k ? s.pillActive : {}) }}>{v.label} ({n})</button>;
-        })}
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        <button onClick={() => setModo('achados')} style={{ ...s.pill, ...(modo === 'achados' ? s.pillActive : {}) }}>Achados (agrupado)</button>
+        <button onClick={() => setModo('lista')} style={{ ...s.pill, ...(modo === 'lista' ? s.pillActive : {}) }}>Lista completa ({lista.length})</button>
       </div>
-      {filtrada.length === 0 ? (
-        <div style={s.panel}>Nenhuma exceção nessa camada para {compAtual}. 🎉</div>
-      ) : (
-        <div style={s.panel}>
-          <table style={s.table}>
-            <thead><tr><th style={s.th}>Colaborador</th><th style={s.th}>Cargo / Centro de Custo</th><th style={s.th}>Regra</th><th style={s.th}>Diferença</th><th style={s.th}>Confiança</th><th style={s.th}>Status</th></tr></thead>
-            <tbody>
-              {filtrada.map((e) => {
-                const chip = statusChip[e.status] || (e.confianca === 'alta' ? statusChip.aguardando_rh : statusChip.revisar);
-                return (
-                  <tr key={`${e.tier}-${e.idx}`} style={{ ...s.tr, cursor: 'pointer' }} onClick={() => setSelecionado(e)}>
-                    <td style={s.td}>
-                      <div style={{ fontWeight: 600 }}>{e.nome}</div>
-                      <div style={{ fontSize: 11, color: BRAND.gray, fontFamily: 'IBM Plex Mono, monospace' }}>{e.matricula}</div>
-                    </td>
-                    <td style={s.td}><div>{e.cargo}</div><div style={{ fontSize: 11, color: BRAND.gray }}>{e.centro_custo}</div></td>
-                    <td style={{ ...s.td, maxWidth: 340 }}>{e.regra}</td>
-                    <td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace', color: e.diferenca < 0 ? '#D64545' : BRAND.deep }}>
-                      {typeof e.diferenca === 'number' ? (Math.abs(e.diferenca) < 100 ? `${e.diferenca.toFixed(2)}h` : fmtBRL(e.diferenca)) : '—'}
-                    </td>
-                    <td style={s.td}>
-                      <span style={{ ...s.statusChip, color: e.confianca === 'alta' ? '#D64545' : BRAND.gray, borderColor: e.confianca === 'alta' ? '#D64545' : BRAND.gray }}>
-                        {e.confianca === 'alta' ? 'Alta' : 'Revisar'}
-                      </span>
-                    </td>
-                    <td style={s.td}><span style={{ ...s.statusChip, color: chip[1], borderColor: chip[1] }}>{chip[0]}</span></td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+
+      {modo === 'achados' && resultadoAchados && (
+        <>
+          <div style={s.hexRow}>
+            <HexKpi label="R$ em Risco" value={fmtBRL(resultadoAchados.valorEmRisco)} sub="alta confiança, valores monetários" tone={resultadoAchados.valorEmRisco > 0 ? 'danger' : 'good'} />
+            <HexKpi label="Achados (causas raiz)" value={fmtNum(resultadoAchados.achados.length)} sub={`de ${resultadoAchados.totalAposFiltro} itens materiais`} />
+            <HexKpi label="Reincidências" value={fmtNum(resultadoAchados.achados.reduce((s, a) => s + a.reincidentes, 0))} sub="mesmo colaborador, mesmo erro, mês passado" tone={resultadoAchados.achados.some((a) => a.reincidentes > 0) ? 'danger' : 'good'} />
+            <HexKpi label="Abaixo da Materialidade" value={fmtNum(resultadoAchados.itensAbaixoMaterialidade)} sub="filtrado (< R$5 ou < 1h) — não exibido" />
+          </div>
+
+          {resultadoAchados.achados.length === 0 ? (
+            <div style={s.panel}>Nenhum achado material em {compAtual}. 🎉</div>
+          ) : (
+            <div style={s.panel}>
+              <div style={s.panelTitle}>Achados por causa raiz — ordenado por impacto financeiro</div>
+              <p style={{ fontSize: 11.5, color: BRAND.gray, marginBottom: 14 }}>
+                Cada linha é UMA causa, não um colaborador — clica pra ver todo mundo afetado por ela. Diferenças abaixo de R$5,00 (ou 1h em regras de hora) já foram filtradas por não serem materiais.
+              </p>
+              <table style={s.table}>
+                <thead><tr><th style={s.th}>Camada</th><th style={s.th}>Causa</th><th style={s.th}>Colaboradores</th><th style={s.th}>Reincidentes</th><th style={s.th}>Impacto</th><th style={s.th}>Confiança</th></tr></thead>
+                <tbody>
+                  {resultadoAchados.achados.map((a, i) => (
+                    <React.Fragment key={i}>
+                      <tr style={{ ...s.tr, cursor: 'pointer', background: achadoAberto === i ? '#F3F8FA' : undefined }} onClick={() => setAchadoAberto(achadoAberto === i ? null : i)}>
+                        <td style={s.td}><span style={s.tierTag}>{TIER_META[a.tier]?.label || a.tier}</span></td>
+                        <td style={{ ...s.td, maxWidth: 380, fontWeight: 600 }}>{achadoAberto === i ? '▾' : '▸'} {a.regra}</td>
+                        <td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{a.quantidade}</td>
+                        <td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace', color: a.reincidentes > 0 ? '#D64545' : '#33414D' }}>{a.reincidentes > 0 ? `${a.reincidentes} ⟲` : '—'}</td>
+                        <td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{fmtBRL(a.impactoTotal)}</td>
+                        <td style={s.td}>
+                          <span style={{ ...s.statusChip, color: a.confianca === 'alta' ? '#D64545' : BRAND.gray, borderColor: a.confianca === 'alta' ? '#D64545' : BRAND.gray }}>
+                            {a.confianca === 'alta' ? 'Alta' : 'Revisar'}
+                          </span>
+                        </td>
+                      </tr>
+                      {achadoAberto === i && (
+                        <tr>
+                          <td colSpan={6} style={{ padding: '0 0 16px 0', background: '#FAFBFC' }}>
+                            {renderTabela(a.itens.map((it) => ({ ...it, tier: a.tier })))}
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       )}
+
+      {modo === 'lista' && (
+        <>
+          <div style={s.pillRow}>
+            <button onClick={() => setTierAtivo('todos')} style={{ ...s.pill, ...(tierAtivo === 'todos' ? s.pillActive : {}) }}>Todas ({lista.length})</button>
+            {Object.entries(TIER_META).map(([k, v]) => {
+              const n = lista.filter((e) => e.tier === k).length;
+              if (!n) return null;
+              return <button key={k} onClick={() => setTierAtivo(k)} style={{ ...s.pill, ...(tierAtivo === k ? s.pillActive : {}) }}>{v.label} ({n})</button>;
+            })}
+          </div>
+          {filtrada.length === 0 ? (
+            <div style={s.panel}>Nenhuma exceção nessa camada para {compAtual}. 🎉</div>
+          ) : (
+            <div style={s.panel}>{renderTabela(filtrada)}</div>
+          )}
+        </>
+      )}
+
       <DetalheExcecao item={selecionado} onClose={() => setSelecionado(null)} onSalvarStatus={salvarStatus} />
     </div>
   );
