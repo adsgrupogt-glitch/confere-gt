@@ -18,8 +18,9 @@ import { parseRelatorioChefia } from './parser-chefia';
 import { cruzarChefias } from './analytics-chefia';
 import { gerarAlertas } from './insights';
 import { salvarResumoCompetencia, salvarExcecoes, salvarTiers, salvarAnalytics, salvarColaboradoresResumo, salvarEstruturaOrganizacional, lerEstruturaOrganizacional, registrarAtividade, listarCompetencias, lerCompetencia, listarAtividade, fecharCompetencia, excluirCompetencia, atualizarStatusExcecao } from './dados';
-import { getVetorhApiUrl, setVetorhApiUrl, getVetorhApiKey, setVetorhApiKey, listarEmpresasVetorh, listarCompetenciasVetorh, buscarFolhaVetorh, historicoRubricaPorCentroCustoVetorh, historicoColaboradorVetorh } from './vetorh-api';
+import { getVetorhApiUrl, setVetorhApiUrl, getVetorhApiKey, setVetorhApiKey, listarEmpresasVetorh, listarCompetenciasVetorh, buscarFolhaVetorh, historicoRubricaPorCentroCustoVetorh, historicoColaboradorVetorh, auditoriaValeAlimentacaoVetorh } from './vetorh-api';
 import { detectarMudancasRubrica, detectarMudancasColaborador } from './analise-historica';
+import { auditarValeAlimentacao } from './analise-va';
 import { rodarEConfirmarConferencia } from './motor-conferencia';
 
 // As 5 empresas do Grupo GT (espelha o backend — usado só pros rótulos e
@@ -266,6 +267,7 @@ function Sidebar({ user, tela, setTela, onLogout }) {
     { id: 'dashboard', label: 'Dashboard' },
     { id: 'upload', label: 'Sincronização Manual' },
     { id: 'excecoes', label: 'Exceções' },
+    { id: 'auditoriaVA', label: 'Auditoria de VA' },
     { id: 'chefias', label: 'Chefias & Estrutura' },
     { id: 'analiseHistorica', label: 'Análise Histórica' },
     { id: 'historico', label: 'Histórico & KPIs' },
@@ -1663,6 +1665,162 @@ const JANELAS_PADRAO = [
   { label: '24 meses', valor: 24 }, { label: 'Todo o histórico', valor: null },
 ];
 
+function AuditoriaVAScreen({ numEmp }) {
+  const [carregando, setCarregando] = useState(true);
+  const [erro, setErro] = useState(null);
+  const [resultado, setResultado] = useState(null);
+  const [meses, setMeses] = useState(6);
+  const [filtro, setFiltro] = useState('todos');
+  const [selecionado, setSelecionado] = useState(null);
+
+  useEffect(() => {
+    if (!numEmp) return;
+    let cancelado = false;
+    setCarregando(true); setErro(null);
+    (async () => {
+      try {
+        const periodo = meses === 'exercicio2026' ? { desde: '01/2026', ate: '06/2026' } : meses;
+        const linhas = await auditoriaValeAlimentacaoVetorh(numEmp, periodo);
+        if (cancelado) return;
+        if (linhas.length === 0) {
+          setResultado({ totalGeral: 0, serieMensal: [], porCentroCusto: [], achados: [] });
+          setErro('nenhuma_rubrica'); // sinaliza pro texto explicativo, não é erro técnico
+        } else {
+          setResultado(auditarValeAlimentacao(linhas));
+        }
+      } catch (e) {
+        if (!cancelado) setErro(e.message || 'Falha ao buscar VA do Vetorh.');
+      } finally {
+        if (!cancelado) setCarregando(false);
+      }
+    })();
+    return () => { cancelado = true; };
+  }, [numEmp, meses]);
+
+  const rotuloTipo = {
+    duplicidade: ['⛔ Duplicidade', '#D64545'], pago_status_invalido: ['⛔ Pago a demitido/abandono', '#D64545'],
+    salto_suspeito: ['⚑ Salto suspeito', '#C97A1B'],
+  };
+
+  const rotuloPeriodo = meses === 'exercicio2026' ? 'o Exercício 2026 (Jan-Jun)' : `os últimos ${meses} meses`;
+
+  if (carregando) return <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Auditoria de Vale Alimentação</div><h1 style={s.pageTitle}>Buscando {rotuloPeriodo} direto do Vetorh...</h1></div></div>;
+  if (erro && erro !== 'nenhuma_rubrica') {
+    return (
+      <div>
+        <div style={s.pageHeader}><div><div style={s.pageEyebrow}>Auditoria de Vale Alimentação</div><h1 style={s.pageTitle}>Não consegui carregar</h1></div></div>
+        <div style={s.panel}>{erro}</div>
+      </div>
+    );
+  }
+
+  const filtrados = resultado.achados.filter((a) => filtro === 'todos' || a.tipo === filtro);
+  const variacaoMes = resultado.serieMensal.length >= 2
+    ? ((resultado.serieMensal[resultado.serieMensal.length - 1].totalBruto / resultado.serieMensal[resultado.serieMensal.length - 2].totalBruto) - 1) * 100
+    : null;
+
+  return (
+    <div>
+      <div style={s.pageHeader}>
+        <div>
+          <div style={s.pageEyebrow}>Auditoria de Vale Alimentação</div>
+          <h1 style={s.pageTitle}>Pente fino — {rotuloPeriodo}</h1>
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {[3, 6, 12].map((m) => <button key={m} onClick={() => setMeses(m)} style={{ ...s.compBtn, ...(meses === m ? s.compBtnActive : {}) }}>{m} meses</button>)}
+          <button onClick={() => setMeses('exercicio2026')} style={{ ...s.compBtn, ...(meses === 'exercicio2026' ? s.compBtnActive : {}) }}>Exercício 2026 (Jan-Jun)</button>
+        </div>
+      </div>
+
+      {erro === 'nenhuma_rubrica' ? (
+        <div style={s.panel}>
+          Não encontrei nenhuma rubrica com nome de Vale Alimentação/Refeição/Cesta em {rotuloPeriodo} dessa empresa no Vetorh. Ou o nome da rubrica é diferente do esperado, ou essa empresa não tem VA cadastrado como rubrica de folha (pode estar num módulo separado — ainda precisamos confirmar isso com a consulta de descoberta).
+        </div>
+      ) : (
+        <>
+          <div style={{ ...s.panel, marginBottom: 18, background: '#F7F9FA' }}>
+            <p style={{ fontSize: 12, color: BRAND.gray, margin: 0, lineHeight: 1.6 }}>
+              O desconto na folha é 1% do valor do benefício (20% pra Vigias/Vigilantes) — os números abaixo já revertem isso pra mostrar o <b>custo real do benefício</b>, não só o que aparece descontado do colaborador.
+            </p>
+          </div>
+
+          <div style={s.hexRow}>
+            <HexKpi label="Custo Real do Benefício" value={fmtBRL(resultado.totalBrutoGeral)} sub={rotuloPeriodo} tone="danger" />
+            <HexKpi label="Subsídio da Empresa" value={fmtBRL(resultado.totalSubsidioEmpresa)} sub="valor bruto menos o desconto do colaborador" />
+            <HexKpi label="Descontado dos Colaboradores" value={fmtBRL(resultado.totalDescontoGeral)} sub="1% (ou 20% pra Vigias) do benefício" />
+            <HexKpi label="Média por Colaborador/Mês" value={fmtBRL(resultado.mediaGeralPorColaborador)} sub="custo real, não o desconto" />
+          </div>
+          <div style={s.hexRow}>
+            <HexKpi label="Variação Último Mês" value={variacaoMes != null ? `${variacaoMes > 0 ? '+' : ''}${variacaoMes.toFixed(1)}%` : '—'} tone={variacaoMes > 15 ? 'danger' : 'good'} sub="custo real vs. mês anterior" />
+            <HexKpi label="Achados do Pente Fino" value={fmtNum(resultado.achados.length)}
+              sub={`${resultado.achados.filter((a) => a.confianca === 'alta').length} de alta confiança`}
+              tone={resultado.achados.some((a) => a.confianca === 'alta') ? 'danger' : 'good'} />
+          </div>
+
+          <div style={s.panel}>
+            <div style={s.panelTitle}>Custo real mês a mês</div>
+            <table style={s.table}>
+              <thead><tr><th style={s.th}>Métrica</th>{resultado.serieMensal.map((m) => <th key={m.competencia} style={s.th}>{m.competencia}</th>)}</tr></thead>
+              <tbody>
+                <tr><td style={{ ...s.td, fontWeight: 600 }}>Custo Real (bruto)</td>{resultado.serieMensal.map((m) => <td key={m.competencia} style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{fmtBRL(m.totalBruto)}</td>)}</tr>
+                <tr><td style={{ ...s.td, fontWeight: 600 }}>Subsídio da Empresa</td>{resultado.serieMensal.map((m) => <td key={m.competencia} style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{fmtBRL(m.subsidioEmpresa)}</td>)}</tr>
+                <tr><td style={{ ...s.td, fontWeight: 600 }}>Descontado do Colaborador</td>{resultado.serieMensal.map((m) => <td key={m.competencia} style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{fmtBRL(m.totalDesconto)}</td>)}</tr>
+                <tr><td style={{ ...s.td, fontWeight: 600 }}>Colaboradores</td>{resultado.serieMensal.map((m) => <td key={m.competencia} style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{fmtNum(m.colaboradores)}</td>)}</tr>
+                <tr><td style={{ ...s.td, fontWeight: 600 }}>Média/Colaborador (real)</td>{resultado.serieMensal.map((m) => <td key={m.competencia} style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{fmtBRL(m.mediaPorColaborador)}</td>)}</tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ ...s.panel, marginTop: 18 }}>
+            <div style={s.panelTitle}>Top centros de custo por gasto de VA</div>
+            <table style={s.table}>
+              <thead><tr><th style={s.th}>Centro de Custo</th><th style={s.th}>Total no período</th></tr></thead>
+              <tbody>
+                {resultado.porCentroCusto.slice(0, 10).map((c) => (
+                  <tr key={c.centroCusto} style={s.tr}><td style={s.td}>{c.centroCusto}</td><td style={{ ...s.td, fontFamily: 'IBM Plex Mono, monospace' }}>{fmtBRL(c.total)}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, margin: '18px 0 16px' }}>
+            <button onClick={() => setFiltro('todos')} style={{ ...s.pill, ...(filtro === 'todos' ? s.pillActive : {}) }}>Todos ({resultado.achados.length})</button>
+            <button onClick={() => setFiltro('duplicidade')} style={{ ...s.pill, ...(filtro === 'duplicidade' ? s.pillActive : {}) }}>Duplicidade ({resultado.achados.filter((a) => a.tipo === 'duplicidade').length})</button>
+            <button onClick={() => setFiltro('pago_status_invalido')} style={{ ...s.pill, ...(filtro === 'pago_status_invalido' ? s.pillActive : {}) }}>Pago a demitido ({resultado.achados.filter((a) => a.tipo === 'pago_status_invalido').length})</button>
+            <button onClick={() => setFiltro('salto_suspeito')} style={{ ...s.pill, ...(filtro === 'salto_suspeito' ? s.pillActive : {}) }}>Salto suspeito ({resultado.achados.filter((a) => a.tipo === 'salto_suspeito').length})</button>
+          </div>
+
+          {filtrados.length === 0 ? (
+            <div style={s.panel}>Nenhum achado nessa categoria. 🎉</div>
+          ) : (
+            <div style={s.panel}>
+              <table style={s.table}>
+                <thead><tr><th style={s.th}>Tipo</th><th style={s.th}>Colaborador</th><th style={s.th}>Centro de Custo</th><th style={s.th}>Competência</th><th style={s.th}>Detalhe</th></tr></thead>
+                <tbody>
+                  {filtrados.map((a, i) => (
+                    <tr key={i} style={s.tr}>
+                      <td style={s.td}><span style={{ ...s.tierTag, color: rotuloTipo[a.tipo][1], background: 'transparent', border: `1px solid ${rotuloTipo[a.tipo][1]}` }}>{rotuloTipo[a.tipo][0]}</span></td>
+                      <td style={s.td}><div style={{ fontWeight: 600 }}>{a.nome}</div><div style={{ fontSize: 11, color: BRAND.gray }}>{a.matricula} · {a.cargo}</div></td>
+                      <td style={s.td}>{a.centroCusto}</td>
+                      <td style={s.td}>{a.competencia}</td>
+                      <td style={{ ...s.td, fontSize: 12 }}>
+                        {a.tipo === 'duplicidade' && <>{a.quantidadeLinhas} linhas de "{a.desRub}" no mesmo mês, total {fmtBRL(a.valorTotal)}.</>}
+                        {a.tipo === 'pago_status_invalido' && <>Status "{a.status}" — desconto de {fmtBRL(a.valor)}, custo real do benefício {fmtBRL(a.valorBruto)}.</>}
+                        {a.tipo === 'salto_suspeito' && <>{fmtBRL(a.valorAtual)} nesse mês vs. média de {fmtBRL(a.mediaAnterior)} nos meses anteriores.</>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+
 function AnaliseHistoricaScreen({ numEmp }) {
   const [carregando, setCarregando] = useState(true);
   const [erro, setErro] = useState(null);
@@ -2003,6 +2161,7 @@ export default function ConfereGT() {
             {tela === 'dashboard' && <Dashboard competencia={competencia} setCompetencia={setCompetencia} user={user} numEmp={numEmp} />}
             {tela === 'upload' && <UploadScreen user={user} numEmp={numEmp} />}
             {tela === 'excecoes' && <ExcecoesScreen numEmp={numEmp} />}
+            {tela === 'auditoriaVA' && <AuditoriaVAScreen numEmp={numEmp} />}
             {tela === 'chefias' && <ChefiasScreen numEmp={numEmp} />}
             {tela === 'analiseHistorica' && <AnaliseHistoricaScreen numEmp={numEmp} />}
             {tela === 'historico' && <HistoricoScreen user={user} numEmp={numEmp} />}

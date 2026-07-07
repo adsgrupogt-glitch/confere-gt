@@ -74,3 +74,18 @@ export async function historicoColaboradorVetorh(numEmp, matricula) {
   const r = await chamar(`/api/historico/colaborador/${matricula}?empresa=${numEmp}`);
   return r.historico;
 }
+
+// Pente fino de Vale Alimentação — linhas cruas (a análise/detecção de
+// anomalia acontece no analise-va.js, não aqui). Passe um número em `meses`
+// (janela rolante) OU { desde, ate } (período explícito, formato "MM/AAAA").
+export async function auditoriaValeAlimentacaoVetorh(numEmp, periodo = 6) {
+  let caminho = `/api/auditoria/vale-alimentacao?empresa=${numEmp}`;
+  if (typeof periodo === 'object') {
+    if (periodo.desde) caminho += `&desde=${periodo.desde.replace('/', '-')}`;
+    if (periodo.ate) caminho += `&ate=${periodo.ate.replace('/', '-')}`;
+  } else {
+    caminho += `&meses=${periodo}`;
+  }
+  const r = await chamar(caminho);
+  return r.linhas;
+}
