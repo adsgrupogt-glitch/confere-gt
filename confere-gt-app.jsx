@@ -486,10 +486,10 @@ function Dashboard({ competencia, setCompetencia, numEmp }) {
           <div style={s.pageEyebrow}>Painel Executivo · RH {sincronizando && <span style={{ color: BRAND.teal }}>· ⟳ sincronizando com o Vetorh...</span>}</div>
           <h1 style={s.pageTitle}>Competência {compAtual}</h1>
         </div>
-        <div style={s.compSwitch}>
-          {mesesComp.map((c) => (
-            <button key={c} onClick={() => setCompetencia(c)} style={{ ...s.compBtn, ...(c === compAtual ? s.compBtnActive : {}) }}>{c}</button>
-          ))}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <select style={s.inputText} value={compAtual} onChange={(e) => setCompetencia(e.target.value)}>
+            {[...mesesComp].reverse().map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
         </div>
       </div>
 
@@ -1248,11 +1248,9 @@ function ExcecoesScreen({ numEmp }) {
     <div>
       <div style={s.pageHeader}>
         <div><div style={s.pageEyebrow}>Competência {compAtual}</div><h1 style={s.pageTitle}>Exceções</h1></div>
-        <div style={s.compSwitch}>
-          {mesesComp.map((c) => (
-            <button key={c} onClick={() => { setCompetencia(c); setTierAtivo('todos'); setAchadoAberto(null); }} style={{ ...s.compBtn, ...(c === compAtual ? s.compBtnActive : {}) }}>{c}</button>
-          ))}
-        </div>
+        <select style={s.inputText} value={compAtual} onChange={(e) => { setCompetencia(e.target.value); setTierAtivo('todos'); setAchadoAberto(null); }}>
+          {[...mesesComp].reverse().map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
       </div>
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
